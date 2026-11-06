@@ -392,6 +392,15 @@ func (s *session) OnUpdate(onUpdate func(types.Event)) {
 				})
 				return
 			}
+			if update.Type == UpdateTypeContextUpdate {
+				contextWindow, _ := s.ContextWindow(context.Background())
+				onUpdate(types.Event{
+					Type:      types.EventTypeContextUpdate,
+					SessionID: update.SessionID,
+					Data:      types.ContextUpdate{ContextWindow: contextWindow},
+				})
+				return
+			}
 			ev := convertEvent(update)
 			if ev.Type == "" {
 				return

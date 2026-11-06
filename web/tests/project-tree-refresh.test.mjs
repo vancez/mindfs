@@ -4,6 +4,8 @@ import { readFileSync } from "node:fs";
 const app = readFileSync(new URL("../src/App.tsx", import.meta.url), "utf8");
 const fileTree = readFileSync(new URL("../src/components/FileTree.tsx", import.meta.url), "utf8");
 const fileService = readFileSync(new URL("../src/services/file.ts", import.meta.url), "utf8");
+const zhCN = readFileSync(new URL("../src/i18n/locales/zh-CN.ts", import.meta.url), "utf8");
+const enUS = readFileSync(new URL("../src/i18n/locales/en-US.ts", import.meta.url), "utf8");
 
 assert.match(
   fileTree,
@@ -43,6 +45,11 @@ assert.match(
 );
 assert.match(
   app,
+  /case "svn":[\s\S]*?await refreshSvnStatus\(root\)/,
+  "svn refresh should reload the current working copy status",
+);
+assert.match(
+  app,
   /case "worktrees":[\s\S]*?loadProjectTreeWorktrees\(root\)[\s\S]*?expandedWorktreeByRoot\[root\][\s\S]*?loadProjectTreeWorktreeStatus\(expandedPath\)/,
   "worktree refresh should reload the list and only the expanded worktree status",
 );
@@ -63,9 +70,28 @@ assert.match(
 );
 assert.match(
   app,
-  /case "related":[\s\S]*?refreshProjectTreeRelatedFiles\(\)[\s\S]*?refreshGitStatus\(root\)/,
-  "related refresh should reload relationships and current file statistics",
+  /case "related":[\s\S]*?refreshProjectTreeRelatedFiles\(\)[\s\S]*?rootIsSvn \? refreshSvnStatus\(root\) : refreshGitStatus\(root\)/,
+  "related refresh should reload relationships and the current VCS file statistics",
 );
+assert.match(
+  fileTree,
+  /SIDEBAR_FOOTER_HIDDEN_STORAGE_KEY = "mindfs-sidebar-footer-hidden"/,
+  "the sidebar footer visibility should be persisted",
+);
+assert.match(
+  fileTree,
+  /setHideSidebarFooter\(\(hidden\) => !hidden\)/,
+  "the sidebar menu should expose a footer visibility toggle",
+);
+assert.match(
+  fileTree,
+  /display: hideSidebarFooter \? "none" : "flex"/,
+  "the whole sidebar footer should be hidden by the toggle",
+);
+for (const key of ["fileTree.hideSidebarFooter"]) {
+  assert.match(zhCN, new RegExp(`"${key.replaceAll(".", "\\.")}"`), `zh-CN should define ${key}`);
+  assert.match(enUS, new RegExp(`"${key.replaceAll(".", "\\.")}"`), `en-US should define ${key}`);
+}
 
 assert.match(
   fileService,

@@ -107,6 +107,7 @@ const E2EE_HEADER = 'X-MindFS-E2EE';
 const CLIENT_ID_HEADER = 'X-MindFS-Client-ID';
 const PROOF_HEADER = 'X-MindFS-Proof';
 const TS_HEADER = 'X-MindFS-TS';
+const NONCE_HEADER = 'X-MindFS-Nonce';
 
 export class MindFSNativeBridge {
   private static activeBridge?: MindFSNativeBridge;
@@ -703,6 +704,8 @@ export class MindFSNativeBridge {
   private async fetchReplyingSessions(config: ReplyPollerConfig): Promise<Array<ReplyState>> {
     const apiBaseUrl = `${config.apiBaseUrl ?? ''}`.trim().replace(/\/+$/, '');
     const requestUrl = `${apiBaseUrl}/api/replying-sessions`;
+    const proofPath = requestProofPath(requestUrl);
+    let requestNonce = '';
     const headers: Record<string, string> = {
       'Accept': 'application/json'
     };
@@ -723,7 +726,7 @@ export class MindFSNativeBridge {
       if (clientId) {
         headers[CLIENT_ID_HEADER] = clientId;
       }
-      await addRequestProofHeaders(headers, config, 'GET', requestUrl);
+      requestNonce = await addRequestProofHeaders(headers, config, 'GET', proofPath);
     }
     const requestTask = http.createHttp();
     try {
@@ -766,8 +769,12 @@ export class MindFSNativeBridge {
         throw new Error(`HTTP ${response.responseCode}`);
       }
       let body = `${response.result ?? ''}`;
-      if (isProtectedE2EEResponse(response.header)) {
-        body = await decryptProtectedBody(config, body);
+      const protectedResponse = isProtectedE2EEResponse(response.header);
+      if (config.e2eeRequired && !protectedResponse) {
+        throw new Error('e2ee_response_unprotected');
+      }
+      if (protectedResponse) {
+        body = await decryptProtectedBody(config, body, 'GET', proofPath, requestNonce);
       }
       const parsed = JSON.parse(body) as ReplyingSessionsResponse;
       hilog.info(DOMAIN, 'MindFS', 'reply poll ok url=%{public}s bodyLength=%{public}d', requestUrl, body.length);
@@ -1012,18 +1019,32 @@ async function addRequestProofHeaders(
   headers: Record<string, string>,
   config: ReplyPollerConfig,
   method: string,
-  requestUrl: string
-): Promise<void> {
+  proofPath: string
+): Promise<string> {
   const clientId = `${config.e2eeClientId ?? ''}`.trim();
   const transportKey = decodeBase64(`${config.e2eeTransportKey ?? ''}`.trim());
   const ts = utcTimestamp();
-  const proofPath = requestProofPath(requestUrl);
-  const proof = await buildRequestProof(transportKey, method, proofPath, ts, clientId);
+  const nonce = generateRequestNonce();
+  const proof = await buildRequestProof(transportKey, method, proofPath, ts, nonce, clientId);
   headers[TS_HEADER] = ts;
+  headers[NONCE_HEADER] = nonce;
   headers[PROOF_HEADER] = proof;
+  return nonce;
 }
 
-async function decryptProtectedBody(config: ReplyPollerConfig, body: string): Promise<string> {
+function generateRequestNonce(): string {
+  const random = cryptoFramework.createRandom();
+  const data = random.generateRandomSync(16);
+  return encodeBase64(data.data).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
+}
+
+async function decryptProtectedBody(
+  config: ReplyPollerConfig,
+  body: string,
+  method: string,
+  proofPath: string,
+  requestNonce: string
+): Promise<string> {
   if (!hasReplyPollerE2EESession(config)) {
     throw new Error('e2ee session missing');
   }
@@ -1036,12 +1057,14 @@ async function decryptProtectedBody(config: ReplyPollerConfig, body: string): Pr
   }
   const ciphertext = ciphertextWithTag.slice(0, ciphertextWithTag.length - 16);
   const authTag = ciphertextWithTag.slice(ciphertextWithTag.length - 16);
+  const separator = String.fromCharCode(0x1f);
+  const aad = utf8Bytes(['mindfs-envelope-v1', 'response', method, proofPath, requestNonce].join(separator));
   const key = cryptoFramework.createSymKeyGenerator('AES256').convertKeySync({ data: keyBytes });
   const cipher = cryptoFramework.createCipher('AES256|GCM|NoPadding');
   const params: cryptoFramework.GcmParamsSpec = {
     algName: 'GcmParamsSpec',
     iv: { data: nonce },
-    aad: { data: new Uint8Array() },
+    aad: { data: aad },
     authTag: { data: authTag }
   };
   await cipher.init(cryptoFramework.CryptoMode.DECRYPT_MODE, key, params);
@@ -1054,9 +1077,10 @@ async function buildRequestProof(
   method: string,
   path: string,
   ts: string,
+  nonce: string,
   clientId: string
 ): Promise<string> {
-  const digest = await sha256Bytes(['mindfs-request-proof', method, path, ts, clientId].join('\u001f'));
+  const digest = await sha256Bytes(['mindfs-request-proof', method, path, ts, nonce, clientId].join('\u001f'));
   const macKey = cryptoFramework.createSymKeyGenerator('HMAC').convertKeySync({ data: key });
   const macSpec: cryptoFramework.HmacSpec = { algName: 'HMAC', mdName: 'SHA256' };
   const mac = cryptoFramework.createMac(macSpec);

@@ -28,3 +28,12 @@ assert.match(
   "region scaling should change text size without scaling icons or layout",
 );
 assert.match(fontSizeService, /FONT_SIZE_MIN = 0\.8[\s\S]*?FONT_SIZE_MAX = 1\.4[\s\S]*?FONT_SIZE_STEP = 0\.1/);
+
+// iOS Safari auto-zooms the page for focused text controls below 16px. The
+// guard must stay WebKit-only and outrank the region font scaling.
+assert.match(styles, /-webkit-text-size-adjust: 100%;\s*text-size-adjust: 100%;/);
+assert.match(
+  styles,
+  /@supports \(-webkit-touch-callout: none\) \{[\s\S]*?\.mindfs-font-scale-region textarea\[style\][\s\S]*?font-size: max\(16px, 1em\) !important/,
+  "iOS text controls should stay at 16px without leaking to other platforms",
+);

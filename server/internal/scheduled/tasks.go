@@ -538,10 +538,13 @@ func (s *Service) runTask(ctx context.Context, task Task, force bool) error {
 			broadcaster.BroadcastAgentStatusChanged(agentName)
 		},
 		OnSubSessionCreated: func(created *session.Session) {
-			broadcaster.BroadcastSessionMetaUpdated(current.RootID, created)
+			// Mark the child pending before broadcasting metadata so the
+			// metadata carries pending=true and every session list shows the
+			// reply indicator immediately.
 			if created != nil {
 				broadcaster.SetSessionPendingReply(current.RootID, created.Key, created.Name)
 			}
+			broadcaster.BroadcastSessionMetaUpdated(current.RootID, created)
 		},
 		OnSubSessionUpdate: func(sessionKey string, update agenttypes.Event) {
 			broadcaster.BroadcastSessionUpdate(current.RootID, sessionKey, update)

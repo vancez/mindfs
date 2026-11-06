@@ -9,6 +9,16 @@ import {
   type SidebarSide,
   type SwipeDragMode,
 } from "../services/edgeSwipe";
+import {
+  SIDEBAR_MAIN_MIN_WIDTH,
+  clampSidebarWidth,
+  clearStoredSidebarWidth,
+  defaultSidebarWidth,
+  readStoredSidebarWidth,
+  resizedSidebarWidth,
+  writeStoredSidebarWidth,
+  type ResizableSidebarKind,
+} from "./sidebarWidth";
 
 type AppShellProps = {
   sidebar: React.ReactNode;
@@ -35,9 +45,13 @@ const MOBILE_SIDEBAR_WIDTH = "min(85vw, 360px)";
 function useResponsive() {
   const [isMobile, setIsMobile] = useState(false);
   const [isTablet, setIsTablet] = useState(false);
+  const [viewportWidth, setViewportWidth] = useState(() =>
+    typeof window === "undefined" ? 1440 : window.innerWidth,
+  );
   useEffect(() => {
     const checkSize = () => {
       const width = window.innerWidth;
+      setViewportWidth(width);
       setIsMobile(width < MOBILE_BREAKPOINT);
       setIsTablet(width >= MOBILE_BREAKPOINT && width < TABLET_BREAKPOINT);
     };
@@ -45,7 +59,7 @@ function useResponsive() {
     window.addEventListener("resize", checkSize);
     return () => window.removeEventListener("resize", checkSize);
   }, []);
-  return { isMobile, isTablet };
+  return { isMobile, isTablet, viewportWidth };
 }
 
 const sidebarStyle: React.CSSProperties = {
@@ -110,6 +124,31 @@ type DrawerDrag = {
   el: HTMLElement;
 };
 
+type SidebarResizeDrag = {
+  side: SidebarSide;
+  kind: ResizableSidebarKind;
+  pointerId: number;
+  startX: number;
+  startWidth: number;
+  availableWidth: number;
+  currentWidth: number;
+  moved: boolean;
+};
+
+const RAIL_CLICK_DELAY_MS = 280;
+const RAIL_DOUBLE_CLICK_REVERT_MS = 700;
+
+function sidebarStorage(): Storage | null {
+  if (typeof window === "undefined") {
+    return null;
+  }
+  try {
+    return window.localStorage;
+  } catch {
+    return null;
+  }
+}
+
 function mobileSidebarPixelWidth(): number {
   if (typeof window === "undefined") {
     return 360;
@@ -135,12 +174,28 @@ export function AppShell({
   sessionSidebarFontScale = 1,
 }: AppShellProps) {
   const { t } = useI18n();
-  const { isMobile, isTablet } = useResponsive();
+  const { isMobile, isTablet, viewportWidth } = useResponsive();
   const shellRef = useRef<HTMLDivElement | null>(null);
   const dragRef = useRef<DrawerDrag | null>(null);
   const dragProgressRef = useRef(0);
   const suppressClickUntilRef = useRef(0);
   const [dragPreview, setDragPreview] = useState<{ side: SidebarSide; progress: number } | null>(null);
+  const sidebarResizeRef = useRef<SidebarResizeDrag | null>(null);
+  const railClickTimersRef = useRef<Partial<Record<SidebarSide, number>>>({});
+  const railToggleAtRef = useRef<Partial<Record<SidebarSide, number>>>({});
+  const suppressRailClickUntilRef = useRef(0);
+  const [resizingSide, setResizingSide] = useState<SidebarSide | null>(null);
+  const [sidebarWidthOverrides, setSidebarWidthOverrides] = useState<
+    Partial<Record<ResizableSidebarKind, number>>
+  >(() => {
+    const storage = sidebarStorage();
+    const file = readStoredSidebarWidth(storage, "file");
+    const session = readStoredSidebarWidth(storage, "session");
+    return {
+      ...(file !== undefined ? { file } : {}),
+      ...(session !== undefined ? { session } : {}),
+    };
+  });
 
   // 拖拽中跨过 768px 断点（旋转/分屏）：桌面分支没有 pointer 处理器，
   // 不清场会让 dragRef 永久卡死、手势整体失效
@@ -148,15 +203,63 @@ export function AppShell({
     dragRef.current = null;
     dragProgressRef.current = 0;
     setDragPreview(null);
+    // The resize rails unmount below the mobile breakpoint, so a drag that
+    // crosses it may never receive pointerup and would leave the body cursor
+    // and the disabled grid transition behind.
+    sidebarResizeRef.current = null;
+    setResizingSide(null);
   }, [isMobile]);
 
-  const sidebarWidth = isMobile ? "0px" : (isTablet ? "200px" : "260px");
-  const rightWidth = isMobile ? "0px" : (rightSidebar ? (isTablet ? "240px" : "280px") : "0px");
-  const mobileHeight = "var(--mindfs-viewport-height, 100dvh)";
+  useEffect(() => {
+    if (!rightSidebar) {
+      sidebarResizeRef.current = null;
+      setResizingSide(null);
+    }
+  }, [rightSidebar]);
+
+  useEffect(() => {
+    if (!resizingSide) {
+      return;
+    }
+    const { body } = document;
+    const previousCursor = body.style.cursor;
+    const previousUserSelect = body.style.userSelect;
+    body.style.cursor = "col-resize";
+    body.style.userSelect = "none";
+    return () => {
+      body.style.cursor = previousCursor;
+      body.style.userSelect = previousUserSelect;
+    };
+  }, [resizingSide]);
+
+  useEffect(() => () => {
+    for (const timer of Object.values(railClickTimersRef.current)) {
+      window.clearTimeout(timer);
+    }
+    railClickTimersRef.current = {};
+  }, []);
+
+  const physicalLeftKind: ResizableSidebarKind = sidebarsSwapped ? "session" : "file";
+  const physicalRightKind: ResizableSidebarKind = sidebarsSwapped ? "file" : "session";
+  const leftDefaultWidth = defaultSidebarWidth(physicalLeftKind, isTablet);
+  const rightDefaultWidth = defaultSidebarWidth(physicalRightKind, isTablet);
+  const rawLeftWidth = sidebarWidthOverrides[physicalLeftKind] ?? leftDefaultWidth;
+  const rawRightWidth = rightSidebar
+    ? sidebarWidthOverrides[physicalRightKind] ?? rightDefaultWidth
+    : 0;
   const physicalLeftOpen = sidebarsSwapped ? rightOpen : leftOpen;
   const physicalRightOpen = sidebarsSwapped ? leftOpen : rightOpen;
-  const physicalLeftWidth = sidebarsSwapped ? rightWidth : sidebarWidth;
-  const physicalRightWidth = sidebarsSwapped ? sidebarWidth : rightWidth;
+  const physicalLeftAvailableWidth =
+    viewportWidth - (physicalRightOpen ? rawRightWidth : 0) - SIDEBAR_MAIN_MIN_WIDTH;
+  const physicalLeftWidth = clampSidebarWidth(rawLeftWidth, physicalLeftAvailableWidth);
+  const physicalRightAvailableWidth =
+    viewportWidth - (physicalLeftOpen ? physicalLeftWidth : 0) - SIDEBAR_MAIN_MIN_WIDTH;
+  const physicalRightWidth = rightSidebar
+    ? clampSidebarWidth(rawRightWidth, physicalRightAvailableWidth)
+    : 0;
+  const physicalLeftWidthPx = `${physicalLeftWidth}px`;
+  const physicalRightWidthPx = `${physicalRightWidth}px`;
+  const mobileHeight = "var(--mindfs-viewport-height, 100dvh)";
   const physicalLeftContent = sidebarsSwapped ? rightSidebar : sidebar;
   const physicalRightContent = sidebarsSwapped ? sidebar : rightSidebar;
   const physicalLeftClose = sidebarsSwapped ? onCloseRight : onCloseLeft;
@@ -170,6 +273,152 @@ export function AppShell({
   const fontScaleStyle = (scale: number): React.CSSProperties => ({
     "--mindfs-font-scale": scale,
   } as React.CSSProperties);
+
+  const availableWidthForSide = (side: SidebarSide): number => {
+    const otherRawWidth = side === "left" ? rawRightWidth : rawLeftWidth;
+    const otherOpen = side === "left" ? physicalRightOpen : physicalLeftOpen;
+    return viewportWidth - (otherOpen ? otherRawWidth : 0) - SIDEBAR_MAIN_MIN_WIDTH;
+  };
+
+  const resetSidebarWidth = (kind: ResizableSidebarKind) => {
+    setSidebarWidthOverrides((prev) => {
+      if (prev[kind] === undefined) {
+        return prev;
+      }
+      const next = { ...prev };
+      delete next[kind];
+      return next;
+    });
+    clearStoredSidebarWidth(sidebarStorage(), kind);
+  };
+
+  const beginSidebarResize =
+    (side: SidebarSide, kind: ResizableSidebarKind, startWidth: number) =>
+    (event: React.PointerEvent<HTMLButtonElement>) => {
+      if (event.pointerType === "mouse" && event.button !== 0) {
+        return;
+      }
+      if (side === "left" ? !physicalLeftOpen : !physicalRightOpen) {
+        return;
+      }
+      const pendingClick = railClickTimersRef.current[side];
+      if (pendingClick !== undefined) {
+        window.clearTimeout(pendingClick);
+        delete railClickTimersRef.current[side];
+      }
+      sidebarResizeRef.current = {
+        side,
+        kind,
+        pointerId: event.pointerId,
+        startX: event.clientX,
+        startWidth,
+        availableWidth: availableWidthForSide(side),
+        currentWidth: startWidth,
+        moved: false,
+      };
+      try {
+        event.currentTarget.setPointerCapture(event.pointerId);
+      } catch {
+        // Pointer capture is best-effort; the rail still receives the stream.
+      }
+    };
+
+  const moveSidebarResize = (event: React.PointerEvent<HTMLButtonElement>) => {
+    const drag = sidebarResizeRef.current;
+    if (!drag || drag.pointerId !== event.pointerId) {
+      return;
+    }
+    const deltaX = event.clientX - drag.startX;
+    if (!drag.moved) {
+      if (Math.abs(deltaX) < 3) {
+        return;
+      }
+      drag.moved = true;
+      setResizingSide(drag.side);
+    }
+    event.preventDefault();
+    const width = resizedSidebarWidth(
+      drag.side,
+      drag.startWidth,
+      deltaX,
+      drag.availableWidth,
+    );
+    drag.currentWidth = width;
+    setSidebarWidthOverrides((prev) => {
+      if (prev[drag.kind] === width) {
+        return prev;
+      }
+      return { ...prev, [drag.kind]: width };
+    });
+  };
+
+  const finishSidebarResize = (pointerId: number, persist: boolean) => {
+    const drag = sidebarResizeRef.current;
+    if (!drag || drag.pointerId !== pointerId) {
+      return;
+    }
+    sidebarResizeRef.current = null;
+    if (drag.moved) {
+      suppressRailClickUntilRef.current = performance.now() + 250;
+      if (persist) {
+        writeStoredSidebarWidth(sidebarStorage(), drag.kind, drag.currentWidth);
+      }
+    }
+    setResizingSide(null);
+  };
+
+  const togglePhysicalSidebar = (side: SidebarSide) => {
+    if (side === "left") {
+      (physicalLeftOpen ? physicalLeftClose : physicalLeftOpenHandler)?.();
+    } else {
+      (physicalRightOpen ? physicalRightClose : physicalRightOpenHandler)?.();
+    }
+  };
+
+  const handleRailClick =
+    (side: SidebarSide) => (event: React.MouseEvent<HTMLButtonElement>) => {
+      if (performance.now() < suppressRailClickUntilRef.current) {
+        event.preventDefault();
+        event.stopPropagation();
+        return;
+      }
+      if (event.detail === 0) {
+        togglePhysicalSidebar(side);
+        return;
+      }
+      const pendingClick = railClickTimersRef.current[side];
+      if (pendingClick !== undefined) {
+        window.clearTimeout(pendingClick);
+      }
+      railClickTimersRef.current[side] = window.setTimeout(() => {
+        delete railClickTimersRef.current[side];
+        railToggleAtRef.current[side] = performance.now();
+        togglePhysicalSidebar(side);
+      }, RAIL_CLICK_DELAY_MS);
+    };
+
+  const handleRailDoubleClick =
+    (side: SidebarSide, kind: ResizableSidebarKind) =>
+    (event: React.MouseEvent<HTMLButtonElement>) => {
+      event.preventDefault();
+      const pendingClick = railClickTimersRef.current[side];
+      if (pendingClick !== undefined) {
+        window.clearTimeout(pendingClick);
+        delete railClickTimersRef.current[side];
+      }
+      // The platform double-click interval can exceed RAIL_CLICK_DELAY_MS, in
+      // which case the first click already toggled the sidebar. Revert that
+      // toggle so double-click only resets the width.
+      const toggledAt = railToggleAtRef.current[side];
+      if (
+        toggledAt !== undefined &&
+        performance.now() - toggledAt <= RAIL_DOUBLE_CLICK_REVERT_MS
+      ) {
+        delete railToggleAtRef.current[side];
+        togglePhysicalSidebar(side);
+      }
+      resetSidebarWidth(kind);
+    };
 
   const drawerProgress = (side: SidebarSide): number => {
     if (dragPreview && dragPreview.side === side) {
@@ -190,7 +439,7 @@ export function AppShell({
   } = {
     display: isMobile ? "flex" : "grid",
     flexDirection: isMobile ? "column" : undefined,
-    gridTemplateColumns: isMobile ? undefined : `${physicalLeftOpen ? physicalLeftWidth : "0px"} 1fr ${physicalRightOpen ? physicalRightWidth : "0px"}`,
+    gridTemplateColumns: isMobile ? undefined : `${physicalLeftOpen ? physicalLeftWidthPx : "0px"} 1fr ${physicalRightOpen ? physicalRightWidthPx : "0px"}`,
     gridTemplateRows: isMobile ? undefined : "1fr auto",
     gridTemplateAreas: isMobile ? undefined : `"sidebar main right" "sidebar footer right"`,
     minHeight: isMobile ? mobileHeight : "100vh",
@@ -206,7 +455,7 @@ export function AppShell({
     overflow: "hidden",
     isolation: "isolate",
     boxSizing: "border-box",
-    transition: "grid-template-columns 0.3s cubic-bezier(0.4, 0, 0.2, 1)",
+    transition: resizingSide ? "none" : "grid-template-columns 0.3s cubic-bezier(0.4, 0, 0.2, 1)",
     "--mindfs-actionbar-bottom-padding": "calc(var(--mindfs-safe-area-bottom) + 12px)",
     "--mindfs-file-menu-width": isMobile ? "min(240px, calc(100vw - 16px))" : "220px",
   };
@@ -732,24 +981,38 @@ export function AppShell({
           <button
             type="button"
             className={`mindfs-sidebar-resize-rail mindfs-sidebar-resize-rail--left${physicalLeftOpen ? " is-open" : " is-closed"}`}
-            onClick={physicalLeftOpen ? physicalLeftClose : physicalLeftOpenHandler}
+            data-sidebar-resize="left"
+            onClick={handleRailClick("left")}
+            onDoubleClick={handleRailDoubleClick("left", physicalLeftKind)}
+            onPointerDown={beginSidebarResize("left", physicalLeftKind, physicalLeftWidth)}
+            onPointerMove={moveSidebarResize}
+            onPointerUp={(event) => finishSidebarResize(event.pointerId, true)}
+            onPointerCancel={(event) => finishSidebarResize(event.pointerId, true)}
+            onLostPointerCapture={(event) => finishSidebarResize(event.pointerId, true)}
             aria-label={physicalLeftOpen ? t("sidebar.collapse", { label: physicalLeftLabel }) : t("sidebar.expand", { label: physicalLeftLabel })}
-            title={physicalLeftOpen ? t("sidebar.collapse", { label: physicalLeftLabel }) : t("sidebar.expand", { label: physicalLeftLabel })}
+            title={`${physicalLeftOpen ? t("sidebar.collapse", { label: physicalLeftLabel }) : t("sidebar.expand", { label: physicalLeftLabel })} · ${t("sidebar.resizeHint")}`}
             style={{
-              left: physicalLeftOpen ? `calc(${physicalLeftWidth} - 6px)` : 0,
-              cursor: physicalLeftOpen ? "w-resize" : "e-resize",
+              left: physicalLeftOpen ? `calc(${physicalLeftWidthPx} - 6px)` : 0,
+              cursor: physicalLeftOpen ? "col-resize" : "e-resize",
             }}
           />
           {physicalRightContent ? (
             <button
               type="button"
               className={`mindfs-sidebar-resize-rail mindfs-sidebar-resize-rail--right${physicalRightOpen ? " is-open" : " is-closed"}`}
-              onClick={physicalRightOpen ? physicalRightClose : physicalRightOpenHandler}
+              data-sidebar-resize="right"
+              onClick={handleRailClick("right")}
+              onDoubleClick={handleRailDoubleClick("right", physicalRightKind)}
+              onPointerDown={beginSidebarResize("right", physicalRightKind, physicalRightWidth)}
+              onPointerMove={moveSidebarResize}
+              onPointerUp={(event) => finishSidebarResize(event.pointerId, true)}
+              onPointerCancel={(event) => finishSidebarResize(event.pointerId, true)}
+              onLostPointerCapture={(event) => finishSidebarResize(event.pointerId, true)}
               aria-label={physicalRightOpen ? t("sidebar.collapse", { label: physicalRightLabel }) : t("sidebar.expand", { label: physicalRightLabel })}
-              title={physicalRightOpen ? t("sidebar.collapse", { label: physicalRightLabel }) : t("sidebar.expand", { label: physicalRightLabel })}
+              title={`${physicalRightOpen ? t("sidebar.collapse", { label: physicalRightLabel }) : t("sidebar.expand", { label: physicalRightLabel })} · ${t("sidebar.resizeHint")}`}
               style={{
-                right: physicalRightOpen ? `calc(${physicalRightWidth} - 6px)` : 0,
-                cursor: physicalRightOpen ? "e-resize" : "w-resize",
+                right: physicalRightOpen ? `calc(${physicalRightWidthPx} - 6px)` : 0,
+                cursor: physicalRightOpen ? "col-resize" : "w-resize",
               }}
             />
           ) : null}

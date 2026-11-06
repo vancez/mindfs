@@ -189,13 +189,17 @@ class BootstrapService {
 
 async function fetchRelayStatus(): Promise<RelayStatusPayload | null> {
   const target = appPath("/api/relay/status");
-  const response = e2eeService.isRequired() && e2eeService.hasSecret()
+  const protectedRequest = e2eeService.isRequired() && e2eeService.hasSecret();
+  const response = protectedRequest
     ? await e2eeService.protectedFetch(target)
     : await fetch(target);
   if (!response.ok) {
     throw new Error(`relay_status_failed_${response.status}`);
   }
-  return e2eeService.parseProtectedJSONResponse<RelayStatusPayload>(response);
+  return e2eeService.parseProtectedJSONResponse<RelayStatusPayload>(
+    response,
+    protectedRequest ? undefined : { allowPlaintext: true },
+  );
 }
 
 async function postRelayBindStart(): Promise<RelayStatusPayload | null> {

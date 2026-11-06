@@ -940,8 +940,16 @@ func (s *session) handleRawEvent(event *codexsdk.RawEvent) bool {
 			return false
 		}
 		s.mu.Lock()
+		changed := s.contextWindow != usage
 		s.contextWindow = usage
 		s.mu.Unlock()
+		if changed && usage.TotalTokens > 0 && usage.ModelContextWindow > 0 {
+			s.emit(types.Event{
+				Type:      types.EventTypeContextUpdate,
+				SessionID: s.SessionID(),
+				Data:      types.ContextUpdate{ContextWindow: usage},
+			})
+		}
 		return true
 	case "item.plan.delta":
 		plan, ok := parsePlanDelta(event.Raw)

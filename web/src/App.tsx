@@ -113,9 +113,17 @@ import {
   type GitWorktreeItem,
 } from "./services/git";
 import {
-  relatedFileStatKey,
-  useRelatedFileStats,
-} from "./hooks/useRelatedFileStats";
+  commitSvn,
+  fetchSvnDiff,
+  fetchSvnRelatedFileDiff,
+  fetchSvnStatus,
+  resolveSvn,
+  revertSvn,
+  updateSvn,
+  type SvnActionPayload,
+  type SvnStatusItem,
+  type SvnStatusPayload,
+} from "./services/svn";
 import {
   DEFAULT_DIRECTORY_SORT_MODE,
   type DirectorySortMode,
@@ -149,6 +157,7 @@ import {
   applyPinnedSnapshotToSessions,
   mergeSessionItems,
 } from "./services/sessionListMerge";
+import { deriveSessionMetrics } from "./services/sessionMetrics";
 // 直接导入标准组件
 import { AppShell } from "./layout/AppShell";
 import { ModeIcon } from "./components/ModeIcon";
@@ -159,9 +168,11 @@ import {
 } from "./components/FileTree";
 import { FileViewer } from "./components/FileViewer";
 import { GitDiffViewer } from "./components/GitDiffViewer";
+import { SvnStatusPanel } from "./components/SvnStatusPanel";
 import { GitHistoryPanel } from "./components/GitHistoryPanel";
 import { GitStatusPanel } from "./components/GitStatusPanel";
 import { SessionViewer } from "./components/SessionViewer";
+import { SessionStatusBadge } from "./components/SessionStatusBadge";
 import { DefaultListView, type MainContentViewMode } from "./components/DefaultListView";
 import { MultiProjectSessionList, SessionList, type ProjectSessionGroup } from "./components/SessionList";
 import { HandoffPackDialog } from "./components/HandoffPackDialog";
@@ -560,11 +571,13 @@ function toSessionItem(
       typeof session?.closed_at === "string" ? session.closed_at : undefined,
     context_window:
       session?.context_window &&
-      Number(session.context_window.totalTokens) > 0 &&
-      Number(session.context_window.modelContextWindow) > 0
+      Number(session.context_window.totalTokens) > 0
         ? {
             totalTokens: Number(session.context_window.totalTokens),
-            modelContextWindow: Number(session.context_window.modelContextWindow),
+            modelContextWindow: Math.max(
+              0,
+              Number(session.context_window.modelContextWindow) || 0,
+            ),
           }
         : undefined,
     search_seq:
@@ -647,11 +660,6 @@ type AttachedFileContext = {
   endLine?: number;
   text?: string;
 };
-type GitFileStat = {
-  status: string;
-  additions: number;
-  deletions: number;
-};
 type RelatedFileClickTarget = {
   path: string;
   head?: string;
@@ -684,9 +692,21 @@ type ManagedRootPayload = {
   root_path?: string;
   is_git_repo?: boolean;
   is_git_worktree?: boolean;
+  is_svn_repo?: boolean;
   size?: number;
   mtime?: string;
 };
+
+type ActiveSvnDiffRequest =
+  | { kind: "file"; rootID: string; path: string }
+  | {
+      kind: "related";
+      rootID: string;
+      path: string;
+      repoPath?: string;
+      revision?: string;
+      displayPath?: string;
+    };
 type LocalDirItemPayload = {
   name?: string;
   path?: string;
@@ -2454,6 +2474,12 @@ export function App({ onGoHome }: AppProps) {
   const [managedRootIds, setManagedRootIds] = useState<string[]>([]);
   const managedRootByIdRef = useRef<Record<string, ManagedRootPayload>>({});
   const [rootEntries, setRootEntries] = useState<FileEntry[]>([]);
+  const currentRootIsSvnRepo = useMemo(() => {
+    const rootID = currentRootId || "";
+    if (!rootID) return false;
+    const meta = managedRootByIdRef.current[rootID];
+    return meta?.is_svn_repo === true && meta?.is_git_repo !== true;
+  }, [currentRootId, managedRootIds, rootEntries]);
   const [creatingRootName, setCreatingRootName] = useState<string | null>(null);
   const [creatingRootParentPath, setCreatingRootParentPath] = useState<string | null>(null);
   const [creatingRootKind, setCreatingRootKind] = useState<"root" | "worktree">("root");
@@ -2582,6 +2608,18 @@ export function App({ onGoHome }: AppProps) {
     loadStringBooleanRecord(GIT_HISTORY_EXPANDED_STORAGE_KEY),
   );
   const [gitDiff, setGitDiff] = useState<GitDiffPayload | null>(null);
+  const [svnStatus, setSvnStatus] = useState<SvnStatusPayload | null>(null);
+  const [svnStatusRootID, setSvnStatusRootID] = useState("");
+  const [svnStatusLoading, setSvnStatusLoading] = useState(false);
+  const [svnStatusError, setSvnStatusError] = useState("");
+  const [svnActionBusy, setSvnActionBusy] = useState<{
+    rootID: string;
+    action: "update" | "commit" | "revert" | "resolve";
+  } | null>(null);
+  const [svnActionError, setSvnActionError] = useState("");
+  const [svnActionOutput, setSvnActionOutput] = useState("");
+  const svnStatusRequestSeqRef = useRef(0);
+  const activeSvnDiffRequestRef = useRef<ActiveSvnDiffRequest | null>(null);
   const [relatedSelectedFileKey, setRelatedSelectedFileKey] = useState("");
   const [treeSortMode, setTreeSortMode] = useState<DirectorySortMode>(() => {
     if (typeof window === "undefined") {
@@ -2645,6 +2683,10 @@ export function App({ onGoHome }: AppProps) {
     nonce: number;
   } | null>(null);
   const [projectTreeTab, setProjectTreeTab] = useState<ProjectTreeTab>("files");
+  const projectTreeTabRef = useRef<ProjectTreeTab>(projectTreeTab);
+  useEffect(() => {
+    projectTreeTabRef.current = projectTreeTab;
+  }, [projectTreeTab]);
   const [worktreeItemsByRoot, setWorktreeItemsByRoot] = useState<Record<string, GitWorktreeItem[]>>({});
   const [worktreeLoadingByRoot, setWorktreeLoadingByRoot] = useState<Record<string, boolean>>({});
   const [worktreeErrorByRoot, setWorktreeErrorByRoot] = useState<Record<string, string>>({});
@@ -3364,10 +3406,20 @@ export function App({ onGoHome }: AppProps) {
     (groups: MultiProjectSessionGroup[], pendingByKey: Record<string, boolean>) =>
       groups.map((group) => ({
         ...group,
-        sessions: group.sessions.map((session) => ({
-          ...(session as any),
-          pending: !!pendingByKey[rootSessionKey(group.rootId, session.key || session.session_key)],
-        }) as SessionItem),
+        sessions: group.sessions.map((session) => {
+          const key = rootSessionKey(group.rootId, session.key || session.session_key);
+          const override = pendingByKey[key];
+          return {
+            ...(session as any),
+            // Server-reported pending covers sessions whose stream events only
+            // reach clients bound to them (for example subagent children).
+            // Local state is authoritative once received: an explicit false
+            // must clear a stale pending flag baked into an earlier list
+            // response, otherwise finished replies keep blinking.
+            pending:
+              typeof override === "boolean" ? override : !!(session as any).pending,
+          } as SessionItem;
+        }),
       })),
     [rootSessionKey],
   );
@@ -3380,12 +3432,7 @@ export function App({ onGoHome }: AppProps) {
       }
       const key = rootSessionKey(resolvedRoot, resolvedKey);
       setMultiProjectPendingByKey((prev) => {
-        const next = { ...prev };
-        if (pending) {
-          next[key] = true;
-        } else {
-          delete next[key];
-        }
+        const next = { ...prev, [key]: pending };
         multiProjectPendingRef.current = next;
         setMultiProjectSessionGroups((groups) => applyPendingToMultiProjectGroups(groups, next));
         return next;
@@ -4012,6 +4059,10 @@ export function App({ onGoHome }: AppProps) {
       const selectedKey = selected?.key || selected?.session_key;
       const selectedRoot =
         (selected?.root_id as string | undefined) || currentRootIdRef.current;
+      const selectedPendingInMain =
+        selectedRoot === rootID &&
+        selectedKey === pendingKey &&
+        mainViewPreferenceByRootRef.current[rootID] === "session";
       const pendingName =
         (typeof (pendingCached as any)?.name === "string" &&
         (pendingCached as any).name
@@ -4123,8 +4174,27 @@ export function App({ onGoHome }: AppProps) {
       if (cacheChanged) {
         bumpCacheVersion();
       }
+      if (
+        selectedPendingInMain &&
+        currentRootIdRef.current === rootID &&
+        mainViewPreferenceByRootRef.current[rootID] === "session"
+      ) {
+        replaceURLState({
+          root: rootID,
+          file: "",
+          session: sessionKey,
+          cursor: 0,
+          pluginQuery: {},
+        });
+      }
     },
-    [rootSessionKey, setBoundSessionForRoot, setDrawerSessionForRoot, bumpCacheVersion],
+    [
+      rootSessionKey,
+      setBoundSessionForRoot,
+      setDrawerSessionForRoot,
+      bumpCacheVersion,
+      replaceURLState,
+    ],
   );
 
   const resolveRuntimeMetaForSession = useCallback(
@@ -4678,6 +4748,54 @@ export function App({ onGoHome }: AppProps) {
     [bumpCacheVersion, rootSessionKey],
   );
 
+  // Mid-turn context updates refresh the pinned status badge without waiting
+  // for message_done. They only carry session-level telemetry, so the latest
+  // assistant exchange keeps its finalized per-turn values until the turn ends.
+  const applyLiveContextWindow = useCallback(
+    (
+      rootID: string,
+      sessionKey: string,
+      contextWindow?: { totalTokens?: number; modelContextWindow?: number },
+    ) => {
+      const totalTokens = Math.max(0, Number(contextWindow?.totalTokens || 0));
+      const modelContextWindow = Math.max(0, Number(contextWindow?.modelContextWindow || 0));
+      // Before the first turn completes we only know used tokens; keep the
+      // update so the status badge can render a count without a percentage.
+      if (!totalTokens) {
+        return;
+      }
+      const nextContextWindow = { totalTokens, modelContextWindow };
+      const cacheKey = rootSessionKey(rootID, sessionKey);
+      const cached = sessionCacheRef.current[cacheKey];
+      if (cached) {
+        sessionCacheRef.current[cacheKey] = {
+          ...(cached as any),
+          context_window: nextContextWindow,
+        } as Session;
+      }
+      setSelectedSession((prev) => {
+        const prevRoot =
+          (prev?.root_id as string | undefined) || currentRootIdRef.current;
+        if (!prev || prevRoot !== rootID || (prev.key || prev.session_key) !== sessionKey) {
+          return prev;
+        }
+        return {
+          ...(prev as any),
+          context_window: nextContextWindow,
+        } as SessionItem;
+      });
+      const drawer = drawerSessionByRootRef.current[rootID];
+      if (drawer && drawer.key === sessionKey) {
+        setDrawerSessionForRoot(rootID, {
+          ...(drawer as any),
+          context_window: nextContextWindow,
+        } as Session);
+      }
+      bumpCacheVersion();
+    },
+    [bumpCacheVersion, rootSessionKey],
+  );
+
   const normalizeTreeResponse = useCallback((payload: any) => {
     if (payload && payload.entries)
       return { entries: payload.entries as FileEntry[] };
@@ -4836,6 +4954,199 @@ export function App({ onGoHome }: AppProps) {
       }
     }
   }, []);
+
+  const refreshSvnStatus = useCallback(async (rootID: string) => {
+    if (!rootID) {
+      if (!currentRootIdRef.current) {
+        setSvnStatus(null);
+        setSvnStatusRootID("");
+        setSvnStatusLoading(false);
+        setSvnStatusError("");
+      }
+      return null;
+    }
+    if (managedRootByIdRef.current[rootID]?.is_svn_repo !== true) {
+      if (currentRootIdRef.current === rootID) {
+        setSvnStatus(null);
+        setSvnStatusRootID("");
+        setSvnStatusLoading(false);
+        setSvnStatusError("");
+      }
+      return null;
+    }
+    const requestID = ++svnStatusRequestSeqRef.current;
+    const shouldApply = () =>
+      requestID === svnStatusRequestSeqRef.current &&
+      currentRootIdRef.current === rootID;
+    if (shouldApply()) {
+      setSvnStatusRootID(rootID);
+      setSvnStatusLoading(true);
+      setSvnStatusError("");
+    }
+    try {
+      const next = await fetchSvnStatus(rootID);
+      if (shouldApply()) {
+        setSvnStatus(next);
+        setSvnStatusRootID(rootID);
+      }
+      return next;
+    } catch (err) {
+      console.error("[svn.status] failed", { rootID, err });
+      if (shouldApply()) {
+        setSvnStatus(null);
+        setSvnStatusRootID(rootID);
+        setSvnStatusError(err instanceof Error ? err.message : "");
+      }
+      return null;
+    } finally {
+      if (requestID === svnStatusRequestSeqRef.current) {
+        setSvnStatusLoading(false);
+      }
+    }
+  }, []);
+
+  const runSvnAction = useCallback(
+    async (
+      rootID: string,
+      action: "update" | "commit" | "revert" | "resolve",
+      run: () => Promise<SvnActionPayload>,
+    ) => {
+      if (!rootID) {
+        return;
+      }
+      setSvnActionBusy({ rootID, action });
+      setSvnActionError("");
+      setSvnActionOutput("");
+      try {
+        const result = await run();
+        if (currentRootIdRef.current === rootID) {
+          // Invalidate a status request that was started before this action;
+          // its older snapshot must not overwrite the action result.
+          svnStatusRequestSeqRef.current += 1;
+          setSvnStatus(result.status);
+          setSvnStatusRootID(rootID);
+          setSvnStatusError("");
+          setSvnStatusLoading(false);
+          setSvnActionOutput(result.output);
+          setGitDiff(null);
+          activeSvnDiffRequestRef.current = null;
+          await refreshTreeDir(
+            rootID,
+            selectedDirRef.current && selectedDirRef.current !== rootID
+              ? selectedDirRef.current
+              : ".",
+            true,
+          );
+        }
+      } catch (err) {
+        const message =
+          err instanceof Error
+            ? err.message
+            : t("common.actionFailed", { action });
+        console.error(`[svn.${action}] failed`, {
+          rootID,
+          message,
+          payload: err instanceof ProtectedAPIError ? err.payload : undefined,
+          err,
+        });
+        if (currentRootIdRef.current === rootID) {
+          setSvnActionError(message);
+          void refreshSvnStatus(rootID);
+        }
+        throw err;
+      } finally {
+        setSvnActionBusy((prev) =>
+          prev && prev.rootID === rootID && prev.action === action ? null : prev,
+        );
+      }
+    },
+    [refreshSvnStatus, refreshTreeDir, t],
+  );
+
+  const handleSvnUpdate = useCallback(
+    (rootID: string) =>
+      runSvnAction(rootID, "update", () => updateSvn(rootID)),
+    [runSvnAction],
+  );
+
+  const handleSvnCommit = useCallback(
+    (rootID: string, message: string, paths: string[]) =>
+      runSvnAction(rootID, "commit", () => commitSvn(rootID, message, paths)),
+    [runSvnAction],
+  );
+
+  const handleSvnRevert = useCallback(
+    (rootID: string, item: SvnStatusItem) => {
+      const path = String(item?.path || "").trim();
+      if (!rootID || !path || item.status === "??") {
+        return;
+      }
+      if (!window.confirm(t("svn.revertConfirm", { path }))) {
+        return;
+      }
+      return runSvnAction(rootID, "revert", () => revertSvn(rootID, path));
+    },
+    [runSvnAction, t],
+  );
+
+  const handleSvnResolve = useCallback(
+    (rootID: string, item: SvnStatusItem) => {
+      const path = String(item?.path || "").trim();
+      if (!rootID || !path) {
+        return;
+      }
+      if (!window.confirm(t("svn.resolveConfirm", { path }))) {
+        return;
+      }
+      return runSvnAction(rootID, "resolve", () => resolveSvn(rootID, path));
+    },
+    [runSvnAction, t],
+  );
+
+  const handleSvnDismissAction = useCallback(() => {
+    setSvnActionError("");
+    setSvnActionOutput("");
+  }, []);
+
+  const refreshActiveSvnDiff = useCallback(
+    async (request: ActiveSvnDiffRequest) => {
+      // The watcher passes the currently displayed request. If the user has
+      // navigated away (or opened another diff) while the fetch is in flight,
+      // this response must not resurrect the old view.
+      if (activeSvnDiffRequestRef.current !== request) {
+        return null;
+      }
+      try {
+        const next =
+          request.kind === "file"
+            ? await fetchSvnDiff(request.rootID, request.path)
+            : await fetchSvnRelatedFileDiff(request.rootID, {
+                path: request.path,
+                head: request.revision,
+                repo_path: request.repoPath,
+              });
+        if (request.kind === "related" && request.displayPath) {
+          next.display_path = request.displayPath;
+        }
+        if (
+          activeSvnDiffRequestRef.current !== request ||
+          currentRootIdRef.current !== request.rootID
+        ) {
+          return null;
+        }
+        setGitDiff(next);
+        return next;
+      } catch (err) {
+        console.error("[svn.diff.refresh] failed", {
+          rootID: request.rootID,
+          path: request.path,
+          err,
+        });
+        return null;
+      }
+    },
+    [],
+  );
 
   const refreshGitHistory = useCallback(async (
     rootID: string,
@@ -5170,7 +5481,13 @@ export function App({ onGoHome }: AppProps) {
     try {
       const payload = await apiProtectedJSON<any>(appPath("/api/replying-sessions"));
       const items = Array.isArray(payload?.sessions) ? payload.sessions : [];
+      // The endpoint is a complete snapshot: anything it omits is not
+      // replying, so explicitly clear previously known pending keys. Otherwise
+      // a pending flag baked into an older session list keeps blinking.
       const next: Record<string, boolean> = {};
+      for (const key of Object.keys(multiProjectPendingRef.current)) {
+        next[key] = false;
+      }
       for (const item of items) {
         const rootID = String(item?.rootId || item?.root_id || "");
         const sessionKey = String(item?.sessionKey || item?.session_key || "");
@@ -5296,6 +5613,54 @@ export function App({ onGoHome }: AppProps) {
       }
     },
     [isMobile, replaceURLState, setMainViewPreferenceForRoot],
+  );
+
+  const openSvnDiff = useCallback(
+    async (rootID: string, item: SvnStatusItem) => {
+      if (!rootID || !item?.path || (item.is_dir && item.status !== "M")) {
+        return;
+      }
+      const requestToken = ++fileOpenRequestRef.current;
+      setRelatedSelectedFileKey("");
+      setMainViewPreferenceForRoot(rootID, "git-diff");
+      setSelectedSession(null);
+      setSelectedSessionLoading(false);
+      setFile(null);
+      setGitDiff(null);
+      activeSvnDiffRequestRef.current = null;
+      replaceURLState({
+        root: rootID,
+        file: "",
+        session: "",
+        cursor: 0,
+        pluginQuery: {},
+      });
+      try {
+        const next = await fetchSvnDiff(rootID, item.path);
+        if (requestToken !== fileOpenRequestRef.current) {
+          return;
+        }
+        setGitDiff(next);
+        activeSvnDiffRequestRef.current = {
+          kind: "file",
+          rootID,
+          path: item.path,
+        };
+        if (currentRootIdRef.current !== rootID) {
+          setCurrentRootId(rootID);
+        }
+        if (isMobile) {
+          setIsLeftOpen(false);
+        }
+      } catch (err) {
+        console.error("[svn.diff] failed", { rootID, path: item.path, err });
+        reportError(
+          "svn.diff_failed",
+          err instanceof Error ? err.message : t("error.svn.diffFailed"),
+        );
+      }
+    },
+    [isMobile, replaceURLState, reportError, setMainViewPreferenceForRoot, t],
   );
 
   const openGitCommitDiff = useCallback(
@@ -5783,6 +6148,113 @@ export function App({ onGoHome }: AppProps) {
     if (rootId) setDeleteSessionTarget({ ...session, root_id: rootId });
   }, []);
 
+  // Shared by the browser that issued the delete and by every other connected
+  // client receiving the session.deleted broadcast. Must stay idempotent.
+  const applySessionDeletion = useCallback(
+    (
+      rootID: string,
+      deletedKeyList: string[],
+      keepChildren: boolean,
+      parentKey: string,
+    ) => {
+      const deletedKeys = new Set(deletedKeyList.filter(Boolean));
+      if (!rootID || deletedKeys.size === 0) {
+        return;
+      }
+      const belongsToRoot = (itemRoot: string | undefined) =>
+        !itemRoot || itemRoot === rootID;
+
+      setSessions((prev) =>
+        prev.filter((item) => (item.root_id && item.root_id !== rootID) || !deletedKeys.has(item.key || item.session_key || ""))
+          .map(item => keepChildren && belongsToRoot(item.root_id) && item.parent_session_key === parentKey ? { ...item, parent_session_key: "" } : item),
+      );
+
+      if (keepChildren) {
+        for (const [cacheKey, cached] of Object.entries(sessionCacheRef.current)) {
+          if (cacheKey.startsWith(`${rootID}::`) && cached.parent_session_key === parentKey) {
+            sessionCacheRef.current[cacheKey] = { ...cached, parent_session_key: "", parent_tool_call_id: "" };
+            void deleteCachedSession(rootID, cached.key);
+          }
+        }
+      }
+
+      for (const deletedKey of deletedKeys) {
+        const cacheKey = rootSessionKey(rootID, deletedKey);
+        delete sessionCacheRef.current[cacheKey];
+        delete loadedSessionRef.current[cacheKey];
+        delete loadingSessionRef.current[cacheKey];
+        delete pendingBySessionRef.current[cacheKey];
+        delete cancelRequestedBySessionRef.current[cacheKey];
+        delete queuedMessagesBySessionRef.current[cacheKey];
+        delete queueFrozenBySessionRef.current[cacheKey];
+        delete optimisticDequeuedIdsRef.current[cacheKey];
+        staleSessionKeysRef.current.delete(cacheKey);
+        setSelectedPendingByKey(deletedKey, false);
+        void deleteCachedSession(rootID, deletedKey);
+      }
+      setQueueVersion((value) => value + 1);
+
+      if (deletedKeys.has(boundSessionByRootRef.current[rootID] || "")) {
+        setBoundSessionForRoot(rootID, null);
+      }
+      if (deletedKeys.has(selectedSessionByRootRef.current[rootID] || "")) {
+        selectedSessionByRootRef.current[rootID] = null;
+      }
+      if (deletedKeys.has(drawerSessionByRootRef.current[rootID]?.key || "")) {
+        setDrawerSessionForRoot(rootID, null);
+        setDrawerOpenForRoot(rootID, false);
+      }
+      setMultiProjectSessionGroups((prev) =>
+        prev.map((group) => {
+          if (group.rootId !== rootID) {
+            return group;
+          }
+          const sessions = group.sessions.filter(
+            (item) => !deletedKeys.has(item.key || item.session_key || ""),
+          ).map(item => keepChildren && item.parent_session_key === parentKey ? { ...item, parent_session_key: "" } : item);
+          return {
+            ...group,
+            sessions,
+            totalCount: Math.max(0, group.totalCount - (group.sessions.length - sessions.length)),
+          };
+        }).filter((group) => group.totalCount > 0 || group.sessions.length > 0),
+      );
+      for (const deletedKey of deletedKeys) {
+        setMultiProjectSessionPending(rootID, deletedKey, false);
+      }
+
+      const selectedKey =
+        selectedSessionRef.current?.key ||
+        selectedSessionRef.current?.session_key;
+      const selectedRoot =
+        (selectedSessionRef.current?.root_id as string | undefined) ||
+        currentRootIdRef.current;
+      if (deletedKeys.has(selectedKey || "") && selectedRoot === rootID) {
+        setSelectedSession(null);
+        setSelectedSessionLoading(false);
+        replaceURLState({
+          root: rootID,
+          file: fileRef.current?.root === rootID ? fileRef.current.path : "",
+          session: "",
+          cursor: fileCursorRef.current || 0,
+          pluginQuery: fileRef.current?.root === rootID ? pluginQueryRef.current : {},
+        });
+      }
+
+      bumpCacheVersion();
+    },
+    [
+      bumpCacheVersion,
+      replaceURLState,
+      rootSessionKey,
+      setBoundSessionForRoot,
+      setDrawerOpenForRoot,
+      setDrawerSessionForRoot,
+      setMultiProjectSessionPending,
+      setSelectedPendingByKey,
+    ],
+  );
+
   const performDeleteSession = useCallback(
     async (session: SessionItem, keepChildren = false): Promise<boolean> => {
       const sessionKey = session?.key || session?.session_key;
@@ -5809,92 +6281,15 @@ export function App({ onGoHome }: AppProps) {
       };
       collectDeletedKeys(sessionKey);
 
-      setSessions((prev) =>
-        prev.filter((item) => (item.root_id && item.root_id !== rootID) || !deletedKeys.has(item.key || item.session_key || ""))
-          .map(item => keepChildren && (!item.root_id || item.root_id === rootID) && item.parent_session_key === sessionKey ? { ...item, parent_session_key: "" } : item),
-      );
-
-      if (keepChildren) {
-        for (const [cacheKey, cached] of Object.entries(sessionCacheRef.current)) {
-          if (cacheKey.startsWith(`${rootID}::`) && cached.parent_session_key === sessionKey) {
-            sessionCacheRef.current[cacheKey] = { ...cached, parent_session_key: "", parent_tool_call_id: "" };
-            void deleteCachedSession(rootID, cached.key);
-          }
-        }
-      }
-
-      for (const deletedKey of deletedKeys) {
-        const cacheKey = rootSessionKey(rootID, deletedKey);
-        delete sessionCacheRef.current[cacheKey];
-        delete loadedSessionRef.current[cacheKey];
-        delete loadingSessionRef.current[cacheKey];
-        delete pendingBySessionRef.current[cacheKey];
-        delete cancelRequestedBySessionRef.current[cacheKey];
-        staleSessionKeysRef.current.delete(cacheKey);
-        void deleteCachedSession(rootID, deletedKey);
-      }
-
-      if (deletedKeys.has(boundSessionByRootRef.current[rootID] || "")) {
-        setBoundSessionForRoot(rootID, null);
-      }
-      if (deletedKeys.has(selectedSessionByRootRef.current[rootID] || "")) {
-        selectedSessionByRootRef.current[rootID] = null;
-      }
-      if (deletedKeys.has(drawerSessionByRootRef.current[rootID]?.key || "")) {
-        setDrawerSessionForRoot(rootID, null);
-        setDrawerOpenForRoot(rootID, false);
-      }
-      setMultiProjectSessionGroups((prev) =>
-        prev.map((group) => {
-          if (group.rootId !== rootID) {
-            return group;
-          }
-          const sessions = group.sessions.filter(
-            (item) => !deletedKeys.has(item.key || item.session_key || ""),
-          ).map(item => keepChildren && item.parent_session_key === sessionKey ? { ...item, parent_session_key: "" } : item);
-          return {
-            ...group,
-            sessions,
-            totalCount: Math.max(0, group.totalCount - (group.sessions.length - sessions.length)),
-          };
-        }).filter((group) => group.totalCount > 0 || group.sessions.length > 0),
-      );
-      for (const deletedKey of deletedKeys) {
-        setMultiProjectSessionPending(rootID, deletedKey, false);
-      }
-
-      const selectedKey =
-        selectedSessionRef.current?.key ||
-        selectedSessionRef.current?.session_key;
-      const selectedRoot =
-        (selectedSessionRef.current?.root_id as string | undefined) ||
-        currentRootIdRef.current;
-      if (deletedKeys.has(selectedKey || "") && selectedRoot === rootID) {
-        setSelectedSession(null);
-        setSelectedSessionLoading(false);
-        replaceURLState({
-          root: rootID,
-          file: fileRef.current?.root === rootID ? fileRef.current.path : "",
-          session: "",
-          cursor: fileCursorRef.current || 0,
-          pluginQuery: fileRef.current?.root === rootID ? pluginQuery : {},
-        });
-      }
-
-      bumpCacheVersion();
+      applySessionDeletion(rootID, Array.from(deletedKeys), keepChildren, sessionKey);
       void loadSessionsForRoot(rootID, { replace: true, force: true });
       return true;
     },
     [
-      bumpCacheVersion,
-      pluginQuery,
-      replaceURLState,
-      rootSessionKey,
-      setBoundSessionForRoot,
-      setDrawerOpenForRoot,
-      setDrawerSessionForRoot,
-      setMultiProjectSessionPending,
+      applySessionDeletion,
       loadSessionsForRoot,
+      reportError,
+      t,
     ],
   );
 
@@ -6713,6 +7108,7 @@ export function App({ onGoHome }: AppProps) {
       const now = new Date().toISOString();
       const requestId = sessionService.createRequestId("msg");
       const tempKey = sendSessionKey ? "" : session?.key || "";
+      const isNewDraft = !sendSessionKey && !!tempKey;
       const userEx: Exchange = {
         role: "user",
         agent: effectiveAgent,
@@ -6825,7 +7221,9 @@ export function App({ onGoHome }: AppProps) {
         !!selectedSessionRef.current &&
         selectedSessionRef.current.key === sendSessionKey &&
         interactionModeRef.current !== "drawer";
-      if (!isBoundInMain) {
+      // A brand-new draft is promoted into the main workspace as soon as the
+      // server accepts it; don't flash the bottom sheet over the task board.
+      if (!isBoundInMain && !isNewDraft) {
         setInteractionMode("drawer");
         setDrawerOpenForRoot(activeRoot, true);
       }
@@ -6871,6 +7269,14 @@ export function App({ onGoHome }: AppProps) {
       if (applyPendingPlanPrefix) {
         outgoingMessage = `/plan ${outgoingMessage}`;
       }
+      const navigationAtSend = {
+        fileRequest: fileOpenRequestRef.current,
+        selectedKey:
+          selectedSessionRef.current?.key ||
+          selectedSessionRef.current?.session_key ||
+          "",
+        mainView: mainViewPreferenceByRootRef.current[activeRoot] || "",
+      };
       const sent = await sessionService.sendMessage(
         activeRoot,
         sendSessionKey || undefined,
@@ -6888,6 +7294,51 @@ export function App({ onGoHome }: AppProps) {
       );
       if (sent && applyPendingPlanPrefix) {
         setPendingPlanMode(false);
+      }
+      const navigatedDuringSend =
+        currentRootIdRef.current !== activeRoot ||
+        fileOpenRequestRef.current !== navigationAtSend.fileRequest ||
+        (selectedSessionRef.current?.key ||
+          selectedSessionRef.current?.session_key ||
+          "") !== navigationAtSend.selectedKey ||
+        (mainViewPreferenceByRootRef.current[activeRoot] || "") !==
+          navigationAtSend.mainView;
+      if (sent && isNewDraft && session && !navigatedDuringSend) {
+        fileOpenRequestRef.current += 1;
+        const draftItem = toSessionItem(activeRoot, {
+          ...(session as any),
+          key: tempKey,
+          session_key: tempKey,
+          root_id: activeRoot,
+          created_at: (session as any).created_at || now,
+          updated_at: now,
+          pending: true,
+        });
+        if (draftItem) {
+          selectedSessionRef.current = draftItem;
+          selectedSessionByRootRef.current[activeRoot] = tempKey;
+          setSelectedSession(draftItem);
+          setSelectedSessionLoading(false);
+          setMainViewPreferenceForRoot(activeRoot, "session");
+          setFile(null);
+          setGitDiff(null);
+          setRelatedSelectedFileKey("");
+          setSelectedDir(activeRoot);
+          setSelectedDirKey(
+            buildDirectorySelectionKey(activeRoot, activeRoot, true),
+          );
+          interactionModeRef.current = "main";
+          setInteractionMode("main");
+          setDrawerOpenForRoot(activeRoot, false);
+          replaceURLState({
+            root: activeRoot,
+            file: "",
+            session: "",
+            cursor: 0,
+            pluginQuery: {},
+          });
+          if (isMobile) setIsRightOpen(false);
+        }
       }
       console.info("[session/send] dispatched", { requestId, rootId: activeRoot, sessionKey: sendSessionKey || null, tempKey: tempKey || null, sent });
       if (!sent) {
@@ -6942,8 +7393,10 @@ export function App({ onGoHome }: AppProps) {
     [
       attachedFileContext,
       getInputSession,
+      isMobile,
       rootSessionKey,
       mergeSessionItems,
+      replaceURLState,
       setSelectedPendingByKey,
       bumpCacheVersion,
       clearSlashCommandResultForSession,
@@ -6951,6 +7404,7 @@ export function App({ onGoHome }: AppProps) {
       setBoundSessionForRoot,
       setDrawerOpenForRoot,
       setDrawerSessionForRoot,
+      setMainViewPreferenceForRoot,
       setMultiProjectSessionPending,
       updateSessionAgentForKey,
       pendingPlanMode,
@@ -7635,7 +8089,7 @@ export function App({ onGoHome }: AppProps) {
         actionHandlers.open({ path, root: rootID, preserveRelatedSelection: true });
         return;
       }
-      if (!head && !file?.repo_path) {
+      if (repoKind !== "svn" && !head && !file?.repo_path) {
         const gitItem = (gitStatus?.items || []).find(
           (item) => item.path === path,
         );
@@ -7646,7 +8100,7 @@ export function App({ onGoHome }: AppProps) {
         actionHandlers.open({ path, root: rootID, preserveRelatedSelection: true });
         return;
       }
-      fileOpenRequestRef.current += 1;
+      const requestToken = ++fileOpenRequestRef.current;
       setMainViewPreferenceForRoot(rootID, "git-diff");
       setSelectedSession(null);
       setSelectedSessionLoading(false);
@@ -7660,7 +8114,13 @@ export function App({ onGoHome }: AppProps) {
         pluginQuery: {},
       });
       try {
-        const next = await fetchGitRelatedFileDiff(rootID, file);
+        const next =
+          repoKind === "svn"
+            ? await fetchSvnRelatedFileDiff(rootID, file)
+            : await fetchGitRelatedFileDiff(rootID, file);
+        if (requestToken !== fileOpenRequestRef.current) {
+          return;
+        }
         const rootPath = managedRootByIdRef.current[rootID]?.root_path;
         const repoPath = String(file?.repo_path || "").trim();
         const displayPath = repoPath
@@ -7670,6 +8130,17 @@ export function App({ onGoHome }: AppProps) {
           next.display_path = displayPath;
         }
         setGitDiff(next);
+        activeSvnDiffRequestRef.current =
+          repoKind === "svn"
+            ? {
+                kind: "related",
+                rootID,
+                path,
+                repoPath,
+                revision: head,
+                displayPath,
+              }
+            : null;
         if (currentRootIdRef.current !== rootID) {
           setCurrentRootId(rootID);
         }
@@ -7678,23 +8149,32 @@ export function App({ onGoHome }: AppProps) {
         }
       } catch (err) {
         const message =
-      err instanceof Error ? err.message : t("git.relatedFileDiffFailed");
-        console.error("[git.related-file.diff] failed", {
-          rootID,
-          path,
-          head,
-          err,
-        });
-        reportError("git.related_file_diff_failed", message, {
-          severity: "warning",
-          recoverable: true,
-          details: {
-            root: rootID,
+          err instanceof Error
+            ? err.message
+            : t(repoKind === "svn" ? "svn.relatedFileDiffFailed" : "git.relatedFileDiffFailed");
+        console.error(
+          repoKind === "svn" ? "[svn.related-file.diff] failed" : "[git.related-file.diff] failed",
+          {
+            rootID,
             path,
             head,
-            payload: err instanceof ProtectedAPIError ? err.payload : undefined,
+            err,
           },
-        });
+        );
+        reportError(
+          repoKind === "svn" ? "svn.related_file_diff_failed" : "git.related_file_diff_failed",
+          message,
+          {
+            severity: "warning",
+            recoverable: true,
+            details: {
+              root: rootID,
+              path,
+              head,
+              payload: err instanceof ProtectedAPIError ? err.payload : undefined,
+            },
+          },
+        );
       }
     },
     [
@@ -8131,6 +8611,34 @@ export function App({ onGoHome }: AppProps) {
     }
     void loadProjectTreeWorktrees(currentRootId);
   }, [currentRootId, loadProjectTreeWorktrees, projectTreeTab, worktreeItemsByRoot, worktreeLoadingByRoot]);
+
+  useEffect(() => {
+    if (!gitDiff) {
+      activeSvnDiffRequestRef.current = null;
+    }
+  }, [gitDiff]);
+
+  useEffect(() => {
+    if (!currentRootId || !currentRootIsSvnRepo) {
+      svnStatusRequestSeqRef.current += 1;
+      setSvnStatus(null);
+      setSvnStatusRootID("");
+      setSvnStatusLoading(false);
+      setSvnStatusError("");
+      setSvnActionError("");
+      setSvnActionOutput("");
+      return;
+    }
+    if (projectTreeTab !== "svn") {
+      return;
+    }
+    setSvnStatus(null);
+    setSvnStatusRootID(currentRootId);
+    setSvnStatusError("");
+    setSvnActionError("");
+    setSvnActionOutput("");
+    void refreshSvnStatus(currentRootId);
+  }, [currentRootId, currentRootIsSvnRepo, projectTreeTab, refreshSvnStatus]);
 
   const handleSwitchWorktree = useCallback(async (item: GitWorktreeItem) => {
     const targetPath = String(item.path || "").trim();
@@ -9137,20 +9645,6 @@ export function App({ onGoHome }: AppProps) {
     [mainEntries, showHiddenFiles],
   );
 
-  const gitFileStatsByPath = useMemo<Record<string, GitFileStat>>(() => {
-    const items = gitStatus?.items || [];
-    return Object.fromEntries(
-      items.map((item) => [
-        item.path,
-        {
-          status: item.status,
-          additions: item.additions,
-          deletions: item.deletions,
-        },
-      ]),
-    );
-  }, [gitStatus]);
-
   useEffect(() => {
     if (!currentRootId) return;
     sessionService.connect(currentRootId);
@@ -9187,10 +9681,22 @@ export function App({ onGoHome }: AppProps) {
       setExternalSelectedKey("");
       return;
     }
+    setGitDiff(null);
+    if (currentRootIsSvnRepo) {
+      setGitStatus(null);
+      setGitHistory(null);
+      setGitStatusLoading(false);
+      setGitHistoryLoading(false);
+      return;
+    }
     void refreshGitStatus(currentRootId);
     void refreshGitHistory(currentRootId);
-    setGitDiff(null);
-  }, [currentRootId, refreshGitHistory, refreshGitStatus]);
+  }, [
+    currentRootId,
+    currentRootIsSvnRepo,
+    refreshGitHistory,
+    refreshGitStatus,
+  ]);
 
   useEffect(() => {
     if (!currentRootId) return;
@@ -9486,7 +9992,13 @@ export function App({ onGoHome }: AppProps) {
       const event = payload.event;
       if (!event?.type) return;
       const markStreamPending = () => {
-        if (event.type === "message_done" || event.type === "error") return;
+        if (
+          event.type === "message_done" ||
+          event.type === "error" ||
+          event.type === "context_update"
+        ) {
+          return;
+        }
         markSessionPending(activeRoot, streamKey);
       };
       const updateDrawerIfShowingStream = () => {
@@ -9574,6 +10086,13 @@ export function App({ onGoHome }: AppProps) {
             event.data || {},
           );
           updateDrawerIfShowingStream();
+          break;
+        case "context_update":
+          applyLiveContextWindow(
+            activeRoot,
+            streamKey,
+            event.data?.contextWindow,
+          );
           break;
         case "message_done":
           attachContextWindowToLatestAssistant(
@@ -9856,39 +10375,61 @@ export function App({ onGoHome }: AppProps) {
         void refreshCurrentFileContent(rootID, currentFile.path);
       }
 
-      void refreshGitStatus(rootID).then((next) => {
-        if (!next?.available) {
-          if (rootID === currentRootIdRef.current) {
-            setGitDiff(null);
+      const rootMeta = managedRootByIdRef.current[rootID];
+      const rootIsSvn =
+        rootMeta?.is_svn_repo === true && rootMeta?.is_git_repo !== true;
+      if (rootIsSvn) {
+        if (rootID === currentRootIdRef.current) {
+          // InspectStatus runs a whole-working-copy diff for line stats. Only
+          // do that while the SVN panel is actually on screen; an open diff
+          // still refreshes independently below.
+          if (projectTreeTabRef.current === "svn") {
+            void refreshSvnStatus(rootID);
           }
-          return;
+          const request = activeSvnDiffRequestRef.current;
+          if (
+            request &&
+            request.rootID === rootID &&
+            paths.includes(request.path)
+          ) {
+            void refreshActiveSvnDiff(request);
+          }
         }
-        const changedDiffPath = gitDiff?.path || "";
-        if (
-          rootID === currentRootIdRef.current &&
-          changedDiffPath &&
-          paths.includes(changedDiffPath)
-        ) {
-          const target = next.items.find(
-            (item) => item.path === changedDiffPath,
-          );
-          if (!target) {
-            setGitDiff(null);
+      } else {
+        void refreshGitStatus(rootID).then((next) => {
+          if (!next?.available) {
+            if (rootID === currentRootIdRef.current) {
+              setGitDiff(null);
+            }
             return;
           }
-          void fetchGitDiff(rootID, changedDiffPath, {
-            cacheSignature: buildGitDiffCacheSignature(target),
-          })
-            .then(setGitDiff)
-            .catch((err) => {
-              console.error("[git.diff.refresh] failed", {
-                rootID,
-                changedPath: changedDiffPath,
-                err,
+          const changedDiffPath = gitDiff?.path || "";
+          if (
+            rootID === currentRootIdRef.current &&
+            changedDiffPath &&
+            paths.includes(changedDiffPath)
+          ) {
+            const target = next.items.find(
+              (item) => item.path === changedDiffPath,
+            );
+            if (!target) {
+              setGitDiff(null);
+              return;
+            }
+            void fetchGitDiff(rootID, changedDiffPath, {
+              cacheSignature: buildGitDiffCacheSignature(target),
+            })
+              .then(setGitDiff)
+              .catch((err) => {
+                console.error("[git.diff.refresh] failed", {
+                  rootID,
+                  changedPath: changedDiffPath,
+                  err,
+                });
               });
-            });
-        }
-      });
+          }
+        });
+      }
 
       const currentDir = currentDirAPI(rootID);
       for (const dir of dirs) {
@@ -10193,6 +10734,41 @@ export function App({ onGoHome }: AppProps) {
           if (failedKey) {
             setMultiProjectSessionPending(rootID, failedKey, false);
           }
+          if (targetKey) {
+            // A brand-new draft failed to create. The optimistic auto-open
+            // may already have selected it, so clear every trace of the
+            // pending key; otherwise the composer stays blocked on a
+            // "pending-" session and the stale draft can be attached to a
+            // later unrelated stream.
+            const pendingCacheKey = rootSessionKey(rootID, targetKey);
+            delete pendingBySessionRef.current[pendingCacheKey];
+            delete sessionCacheRef.current[pendingCacheKey];
+            if (pendingDraftRef.current?.requestId === requestId) {
+              pendingDraftRef.current = null;
+            }
+            if (selectedSessionByRootRef.current[rootID] === targetKey) {
+              selectedSessionByRootRef.current[rootID] = "";
+            }
+            const selectedKey =
+              selectedSessionRef.current?.key ||
+              selectedSessionRef.current?.session_key ||
+              "";
+            if (selectedKey === targetKey) {
+              selectedSessionRef.current = null;
+              setSelectedSession(null);
+              setSelectedSessionLoading(false);
+            }
+            if (boundSessionByRootRef.current[rootID] === targetKey) {
+              setBoundSessionForRoot(rootID, null);
+            }
+            setSelectedPendingByKey(targetKey, false);
+            setSessions((prev) =>
+              prev.filter(
+                (item) => (item.key || item.session_key) !== targetKey,
+              ),
+            );
+            bumpCacheVersion();
+          }
           const latestDrawer = drawerSessionByRootRef.current[rootID];
           if (targetKey && latestDrawer?.key === targetKey) {
             const exchanges = Array.isArray((latestDrawer as any).exchanges)
@@ -10222,21 +10798,60 @@ export function App({ onGoHome }: AppProps) {
               : resolveRootForSessionKey(sessionKey) ||
                 currentRootIdRef.current ||
                 "";
+          // A replayed done is the server's answer to session.ready. Syncing
+          // here sends another session.ready, which makes the server replay
+          // done again and creates an endless getSession + session-list loop.
+          const replayedDone = payload?.replay === true;
           if (rootID && sessionKey) {
-            if (payload?.replay !== true) {
+            if (!replayedDone) {
               playCompletionSound();
             }
             setMultiProjectSessionPending(rootID, sessionKey, false);
             handleSessionStreamDone(rootID, sessionKey);
-            const newest = sessionsRef.current[0]?.updated_at || "";
-            void loadSessionsForRoot(
-              rootID,
-              newest ? { afterTime: newest } : { replace: true },
-            );
-            if (multiProjectSessionsEnabled) {
-              void loadMultiProjectSessionGroups();
+            if (!replayedDone) {
+              // The turn is persisted by now. Re-sync the visible session so
+              // streamed (seq-less) messages get their server seqs; otherwise
+              // "fork from message" keeps an inferred seq and the server rejects
+              // it with "message not found".
+              const doneCacheKey = rootSessionKey(rootID, sessionKey);
+              const queued = queuedMessagesBySessionRef.current[doneCacheKey] || [];
+              const queueFrozen = !!queueFrozenBySessionRef.current[doneCacheKey];
+              const hiddenQueued = optimisticDequeuedIdsRef.current[doneCacheKey];
+              const hasQueuedContinuation =
+                (queued.length > 0 && !queueFrozen) ||
+                !!(hiddenQueued && hiddenQueued.size > 0);
+              const selectedKey =
+                selectedSessionRef.current?.key ||
+                selectedSessionRef.current?.session_key ||
+                "";
+              const drawerKey = drawerSessionByRootRef.current[rootID]?.key || "";
+              const isVisible =
+                selectedKey === sessionKey || drawerKey === sessionKey;
+              if (!hasQueuedContinuation && isVisible) {
+                void restoreActiveSession(rootID, sessionKey).catch((err) => {
+                  console.error("[session.done.sync] failed", {
+                    rootID,
+                    sessionKey,
+                    err,
+                  });
+                });
+              } else if (!isVisible) {
+                // Background sessions are not restored here to avoid extra
+                // traffic, but their cached exchanges still have inferred
+                // seqs. Mark them stale so opening the session syncs real
+                // seqs before the fork button is evaluated.
+                markSessionStale(rootID, sessionKey);
+              }
+              const newest = sessionsRef.current[0]?.updated_at || "";
+              void loadSessionsForRoot(
+                rootID,
+                newest ? { afterTime: newest } : { replace: true },
+              );
+              if (multiProjectSessionsEnabled) {
+                void loadMultiProjectSessionGroups();
+              }
             }
-          } else if (currentRootIdRef.current) {
+          } else if (!replayedDone && currentRootIdRef.current) {
             const newest = sessionsRef.current[0]?.updated_at || "";
             void loadSessionsForRoot(
               currentRootIdRef.current,
@@ -10246,6 +10861,54 @@ export function App({ onGoHome }: AppProps) {
               void refreshMultiProjectReplyingSessions();
               void loadMultiProjectSessionGroups();
             }
+          }
+          break;
+        }
+        case "session.pending.updated": {
+          // Stream and done events only reach clients bound to a session. Every
+          // client still renders session lists, so the server broadcasts the
+          // pending flag globally to keep reply indicators in sync.
+          const rootID =
+            typeof payload?.root_id === "string" ? payload.root_id : "";
+          const sessionKey =
+            typeof payload?.session_key === "string" ? payload.session_key : "";
+          if (!rootID || !sessionKey) {
+            break;
+          }
+          if (payload?.pending === true) {
+            markSessionPending(rootID, sessionKey);
+          } else {
+            handleSessionStreamDone(rootID, sessionKey);
+          }
+          break;
+        }
+        case "session.deleted": {
+          const rootID =
+            typeof payload?.root_id === "string" ? payload.root_id : "";
+          const requestedKey =
+            typeof payload?.session_key === "string" ? payload.session_key : "";
+          const keys = Array.isArray(payload?.keys)
+            ? (payload.keys.filter(
+                (item: any) => typeof item === "string" && item,
+              ) as string[])
+            : [];
+          if (rootID && requestedKey && !keys.includes(requestedKey)) {
+            keys.push(requestedKey);
+          }
+          if (!rootID || keys.length === 0) {
+            break;
+          }
+          applySessionDeletion(
+            rootID,
+            keys,
+            payload?.keep_children === true,
+            requestedKey || keys[0],
+          );
+          if (currentRootIdRef.current === rootID) {
+            void loadSessionsForRoot(rootID, { replace: true, force: true });
+          }
+          if (multiProjectSessionsEnabled) {
+            void loadMultiProjectSessionGroups();
           }
           break;
         }
@@ -10454,6 +11117,16 @@ export function App({ onGoHome }: AppProps) {
           ) {
             const rootID = payload.root_id;
             const sessionKey = payload.session.key;
+            // Subagent children update their reply state without the parent
+            // client receiving their stream: sync the indicator from the
+            // authoritative server value carried by the metadata event.
+            if (typeof payload.session.pending === "boolean") {
+              if (payload.session.pending) {
+                markSessionPending(rootID, sessionKey);
+              } else {
+                handleSessionStreamDone(rootID, sessionKey);
+              }
+            }
             const cacheKey = rootSessionKey(rootID, sessionKey);
             const cached =
               sessionCacheRef.current[cacheKey] ||
@@ -10522,6 +11195,10 @@ export function App({ onGoHome }: AppProps) {
                   payload.session.pinned_at !== undefined
                     ? payload.session.pinned_at || undefined
                     : (cached as any).pinned_at,
+                pending:
+                  typeof payload.session.pending === "boolean"
+                    ? payload.session.pending
+                    : (cached as any).pending,
                 updated_at: payload.session.updated_at || cached.updated_at,
               } as Session;
             bumpCacheVersion();
@@ -10697,6 +11374,7 @@ export function App({ onGoHome }: AppProps) {
       unsubscribeEvents();
     };
   }, [
+    applySessionDeletion,
     currentRootId,
     loadExternalSessions,
     loadMultiProjectSessionGroups,
@@ -10705,6 +11383,7 @@ export function App({ onGoHome }: AppProps) {
     refreshMultiProjectReplyingSessions,
     rootSessionKey,
     resolveRootForSessionKey,
+    restoreActiveSession,
     promotePendingSessionForRoot,
     appendAgentChunkForSession,
     appendThoughtChunkForSession,
@@ -10712,6 +11391,7 @@ export function App({ onGoHome }: AppProps) {
     appendTodoUpdateForSession,
     appendPlanUpdateForSession,
     appendCompactNoticeForSession,
+    applyLiveContextWindow,
     clearSessionStale,
     markSessionPending,
     markSessionStale,
@@ -10727,6 +11407,8 @@ export function App({ onGoHome }: AppProps) {
     refreshCurrentFileContent,
     refreshGitStatus,
     refreshManagedRoots,
+    refreshActiveSvnDiff,
+    refreshSvnStatus,
     updateSessionRelatedWorktreeForKey,
     updateSessionRelatedFilesForKey,
     refreshTasksForRelatedSession,
@@ -11082,6 +11764,20 @@ export function App({ onGoHome }: AppProps) {
     (actionBarSession as any)?.key ||
     (actionBarSession as any)?.session_key ||
     "";
+  const lastActionBarSessionKeyRef = useRef("");
+  useEffect(() => {
+    const key = actionBarSessionKey || "";
+    const previous = lastActionBarSessionKeyRef.current;
+    lastActionBarSessionKeyRef.current = key;
+    if (!key || key === previous) return;
+    // Opening a diff/file clears the selected session, so returning to that
+    // same session arrives here as "" -> key. Drop the file context chip in
+    // both that case and regular session-to-session switches. Draft promotion
+    // (pending -> real key) keeps the context that was just sent.
+    if (key.startsWith("pending-") || previous.startsWith("pending-")) return;
+    handleClearFileContext();
+  }, [actionBarSessionKey, handleClearFileContext]);
+
   const actionBarInputHistory = sessionInputHistory(
     getSessionSnapshot(
       ((actionBarSession as any)?.root_id as string | undefined) || currentRootId,
@@ -11097,6 +11793,20 @@ export function App({ onGoHome }: AppProps) {
       ] || []
     );
   }, [actionBarSessionKey, currentRootId, queueVersion, rootSessionKey]);
+  // The selected session item may only carry header fields. Pull the cached
+  // exchange list so the pinned status badge can also surface the latest turn's
+  // token usage and a context window that arrived after the last list refresh.
+  const actionBarSessionMetrics = useMemo(
+    () =>
+      deriveSessionMetrics(
+        (getSessionSnapshot(
+          ((actionBarSession as any)?.root_id as string | undefined) ||
+            currentRootId,
+          actionBarSession as any,
+        ) || actionBarSession) as any,
+      ),
+    [actionBarSession, actionBarSessionKey, cacheVersion, currentRootId],
+  );
 
   const matchedPlugin = useMemo(() => {
     if (!currentRootId || !file) return null;
@@ -11456,7 +12166,7 @@ export function App({ onGoHome }: AppProps) {
       toolUseId: string;
       answers: Record<string, string>;
     }) => {
-      await sessionService.answerQuestion(
+      return sessionService.answerQuestion(
         input.rootId,
         input.sessionKey,
         input.agent,
@@ -11699,7 +12409,6 @@ export function App({ onGoHome }: AppProps) {
           selectedSession?.root_id || currentRootId || ""
         ]?.root_path || null
       }
-      gitFileStatsByPath={gitFileStatsByPath}
       onFileClick={handleSelectedSessionFileClick}
       onRootClick={(root) => {
         void actionHandlers.open_dir({
@@ -12010,6 +12719,9 @@ export function App({ onGoHome }: AppProps) {
           refreshGitHistory(root, { waitForIncremental: true }),
         ]);
         return;
+      case "svn":
+        await refreshSvnStatus(root);
+        return;
       case "worktrees": {
         const items = await loadProjectTreeWorktrees(root);
         const expandedPath = expandedWorktreeByRoot[root] || "";
@@ -12018,11 +12730,15 @@ export function App({ onGoHome }: AppProps) {
         }
         return;
       }
-      case "related":
+      case "related": {
+        const meta = managedRootByIdRef.current[root];
+        const rootIsSvn =
+          meta?.is_svn_repo === true && meta?.is_git_repo !== true;
         await Promise.all([
           refreshProjectTreeRelatedFiles(),
-          refreshGitStatus(root),
+          rootIsSvn ? refreshSvnStatus(root) : refreshGitStatus(root),
         ]);
+      }
     }
   }, [
     expandedWorktreeByRoot,
@@ -12031,6 +12747,7 @@ export function App({ onGoHome }: AppProps) {
     refreshGitHistory,
     refreshGitStatus,
     refreshProjectTreeRelatedFiles,
+    refreshSvnStatus,
     refreshTreeDir,
   ]);
 
@@ -12275,7 +12992,9 @@ export function App({ onGoHome }: AppProps) {
           (currentRootPath && normalizePath(rawRepoPath) === currentRootPath);
         const repoPath = isCurrentRepoRecord ? "" : rawRepoPath;
         const rawRepoKind = file.repo_kind || "";
-        const repoKind = isCurrentRepoRecord && rawRepoKind !== "plain" ? "" : rawRepoKind;
+        const repoKind = isCurrentRepoRecord && rawRepoKind !== "plain" && rawRepoKind !== "svn"
+          ? ""
+          : rawRepoKind;
         const repoKey = `${repoKind}\0${repoPath}`;
         let repoGroup = groups.find((group) => group.key === repoKey);
         if (!repoGroup) {
@@ -12315,19 +13034,6 @@ export function App({ onGoHome }: AppProps) {
       );
     },
     [currentRootId, relatedSessionRootId, selectedSessionRelatedFiles],
-  );
-  const gitStatsRefreshKey = useMemo(
-    () =>
-      Object.entries(gitFileStatsByPath)
-        .sort(([left], [right]) => left.localeCompare(right))
-        .map(([path, stats]) => `${path}:${stats.status}:${stats.additions}:${stats.deletions}`)
-        .join("|"),
-    [gitFileStatsByPath],
-  );
-  const selectedRelatedFileStatsByKey = useRelatedFileStats(
-    relatedSessionRootId || currentRootId,
-    selectedSessionRelatedFiles,
-    gitStatsRefreshKey,
   );
   const renderRootRelatedContent = (root: string): React.ReactNode => {
     if (!root || root !== currentRootId || root !== relatedSessionRootId) {
@@ -12369,17 +13075,20 @@ export function App({ onGoHome }: AppProps) {
                 >
                   {group.repoKind === "plain"
                     ? `${group.repoName || t("session.currentProject")} · ${t("session.nonGit")}`
-                    : group.head
-                      ? isCurrentRepo
-                        ? `HEAD ${group.head.slice(0, 8)}`
-                        : `${group.repoName || t("session.currentProject")} · HEAD ${group.head.slice(0, 8)}`
-                      : group.repoName || t("session.currentProject")}
+                    : group.repoKind === "svn"
+                      ? group.head && group.head !== "0"
+                        ? isCurrentRepo
+                          ? t("session.svnRevision", { revision: group.head })
+                          : `${group.repoName || t("session.currentProject")} · ${t("session.svnRevision", { revision: group.head })}`
+                        : group.repoName || t("session.currentProject")
+                      : group.head
+                        ? isCurrentRepo
+                          ? `HEAD ${group.head.slice(0, 8)}`
+                          : `${group.repoName || t("session.currentProject")} · HEAD ${group.head.slice(0, 8)}`
+                        : group.repoName || t("session.currentProject")}
                 </div>
               ) : null}
               {group.files.map((file) => {
-                const stats =
-                  selectedRelatedFileStatsByKey[relatedFileStatKey(file)] ||
-                  gitFileStatsByPath[file.path];
                 const fileSelectionKey = relatedFileSelectionKey(file);
                 const isSelected = relatedSelectedFileKey
                   ? fileSelectionKey === relatedSelectedFileKey
@@ -12418,12 +13127,6 @@ export function App({ onGoHome }: AppProps) {
                 <span style={{ flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
                   {file.name}
                 </span>
-                {stats ? (
-                  <span style={{ display: "inline-flex", alignItems: "center", gap: "5px", fontSize: "11px", color: "var(--text-secondary)", flexShrink: 0 }}>
-                    <span style={{ color: "#15803d", fontVariantNumeric: "tabular-nums" }}>+{stats.additions}</span>
-                    <span style={{ color: "#b91c1c", fontVariantNumeric: "tabular-nums" }}>-{stats.deletions}</span>
-                  </span>
-                ) : null}
               </button>
               <button
                 type="button"
@@ -12465,6 +13168,34 @@ export function App({ onGoHome }: AppProps) {
           );
         })}
       </div>
+    );
+  };
+  const renderRootSvnContent = (root: string): React.ReactNode => {
+    if (!root || root !== currentRootId || !currentRootIsSvnRepo) {
+      return null;
+    }
+    return (
+      <SvnStatusPanel
+        key={root}
+        stateKey={root}
+        status={svnStatusRootID === root ? svnStatus : null}
+        loading={svnStatusRootID === root && svnStatusLoading}
+        error={svnStatusRootID === root ? svnStatusError : ""}
+        actionBusy={
+          svnActionBusy?.rootID === root ? svnActionBusy.action : ""
+        }
+        actionError={svnActionError}
+        actionOutput={svnActionOutput}
+        onDismissAction={handleSvnDismissAction}
+        onRefresh={() => refreshSvnStatus(root)}
+        onSelectItem={(item) => {
+          void openSvnDiff(root, item);
+        }}
+        onUpdate={() => handleSvnUpdate(root)}
+        onCommit={(message, paths) => handleSvnCommit(root, message, paths)}
+        onRevert={(item) => handleSvnRevert(root, item)}
+        onResolve={(item) => handleSvnResolve(root, item)}
+      />
     );
   };
   const renderRootGitContent = (root: string): React.ReactNode => {
@@ -14688,8 +15419,10 @@ export function App({ onGoHome }: AppProps) {
               })
             }
             renderRootExtraContent={renderRootGitContent}
+            renderRootSvnContent={renderRootSvnContent}
             renderRootWorktreeContent={renderRootWorktreeContent}
             renderRootRelatedContent={renderRootRelatedContent}
+            currentRootIsSvnRepo={currentRootIsSvnRepo}
             projectTreeTabRequest={projectTreeTabRequest}
             agentConfigSwitchRequest={agentConfigSwitchRequest}
             onAgentConfigSwitched={(agentName) => {
@@ -14863,6 +15596,14 @@ export function App({ onGoHome }: AppProps) {
               onCreateTask={createTaskFromQuickAction}
               onOpenScheduledTasks={openScheduledTasksFromQuickAction}
               taskGroupBadge={actionBarSessionKey ? <TaskGroupPanel key={`${actionBarSession?.root_id || currentRootId}:${actionBarSessionKey}`} rootId={actionBarSession?.root_id || currentRootId || ""} sessionKey={actionBarSessionKey} renderTask={(detail, close) => renderKanbanTaskCard(detail.task, isTerminalKanbanTask(detail.task) ? t("task.column.done") : t("task.column.running"), detail, true, close)} /> : null}
+              sessionStatusBadge={
+                actionBarSessionMetrics ? (
+                  <SessionStatusBadge
+                    metrics={actionBarSessionMetrics}
+                    compact={isMobile}
+                  />
+                ) : null
+              }
               status={status}
               agentsVersion={agentsVersion}
               codexRateLimitsRefreshToken={codexRateLimitsRefreshToken}
@@ -14929,7 +15670,6 @@ export function App({ onGoHome }: AppProps) {
                   null
                 }
                 interactionMode="drawer"
-                gitFileStatsByPath={gitFileStatsByPath}
                 onFileClick={handleDrawerSessionFileClick}
                 onRootClick={(root) => {
                   void actionHandlers.open_dir({

@@ -31,6 +31,7 @@ type ExchangeLike = {
   planUpdate?: PlanUpdate;
   compactNotice?: CompactNotice;
   pending_ack?: boolean;
+  persisted?: boolean;
 };
 
 type ExchangeAuxMapLike = Record<string, ExchangeAux[]>;
@@ -48,6 +49,7 @@ export type TimelineItem =
       fastService?: string;
       pendingAck?: boolean;
       seq?: number;
+      persisted?: boolean;
       contextWindow?: {
         totalTokens: number;
         modelContextWindow: number;
@@ -161,6 +163,7 @@ function assistantSegmentItem(
     effort: ex.effort,
     fastService: ex.fast_service,
     seq: ex.seq,
+    persisted: ex.persisted,
     contextWindow: includeContextWindow ? ex.context_window : undefined,
     tokenUsage: includeContextWindow ? ex.token_usage : undefined,
   };
@@ -330,7 +333,8 @@ function buildBaseTimeline(
     const content = ex.content || "";
     if (role === "user") {
       inferredSeq += 1;
-      const seq = Number(ex.seq || 0) > 0 ? Number(ex.seq || 0) : inferredSeq;
+      const persisted = Number(ex.seq || 0) > 0;
+      const seq = persisted ? Number(ex.seq || 0) : inferredSeq;
       if (!content) continue;
       out.push({
         id: stableTimelineID("user", index, content, ex.timestamp, ex.agent),
@@ -340,14 +344,18 @@ function buildBaseTimeline(
         agent: ex.agent,
         pendingAck: ex.pending_ack === true,
         seq,
+        persisted,
       });
       continue;
     }
     if (role === "agent" || role === "assistant") {
       inferredSeq += 1;
-      const seq = Number(ex.seq || 0) > 0 ? Number(ex.seq || 0) : inferredSeq;
+      const persisted = Number(ex.seq || 0) > 0;
+      const seq = persisted ? Number(ex.seq || 0) : inferredSeq;
       const auxList = seq ? exchangeAux[String(seq)] || [] : [];
-      out.push(...buildAssistantTimeline({ ...ex, seq }, index, auxList));
+      out.push(
+        ...buildAssistantTimeline({ ...ex, seq, persisted }, index, auxList),
+      );
       continue;
     }
     if (role === "thought") {
@@ -481,10 +489,6 @@ export function useSessionStream(
       setIsStreaming(false);
       return;
     }
-    setIsStreaming(
-      sessionPending && sessionService.isSessionStreaming(sessionKey),
-    );
-
     const unsubscribe = sessionService.subscribe(sessionKey, {
       onStream: (event) => {
         setStreamVersion((value) => value + 1);
@@ -496,7 +500,7 @@ export function useSessionStream(
         if (event.type === "message_chunk") {
           setStreamStatusText("");
         }
-        if (event.type === "message_done") {
+        if (event.type === "message_done" || event.type === "context_update") {
           return;
         }
         if (event.type === "error") {
@@ -515,6 +519,16 @@ export function useSessionStream(
         setIsStreaming(false);
       },
     });
+
+    // subscribe() replays events queued while this viewer was unmounted. If
+    // the turn finished during that time, those stale events would re-enter
+    // the generating state forever: recompute from the authoritative live
+    // stream flag, which session.done/session.error already cleared.
+    const streaming = sessionPending && sessionService.isSessionStreaming(sessionKey);
+    setIsStreaming(streaming);
+    if (!streaming) {
+      setStreamStatusText("");
+    }
 
     return () => {
       unsubscribe();

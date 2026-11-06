@@ -236,6 +236,8 @@ func Pull(ctx context.Context, rootPath string) (ActionResult, error) {
 	if err != nil {
 		return ActionResult{}, err
 	}
+	// Fast-forward only: divergent branches abort with an error instead of
+	// creating a merge commit or leaving conflict markers for the UI to manage.
 	output, err := runGit(ctx, repo.repoRoot, "pull", "--ff-only")
 	if err != nil {
 		return ActionResult{}, err
@@ -272,7 +274,7 @@ func Commit(ctx context.Context, rootPath, message string) (ActionResult, error)
 	if message == "" {
 		return ActionResult{}, errors.New("commit message required")
 	}
-	if strings.ContainsAny(message, "\x00\r\n") {
+	if strings.ContainsRune(message, 0) {
 		return ActionResult{}, errors.New("invalid commit message")
 	}
 	output, err := runGit(ctx, repo.repoRoot, "commit", "-am", message)

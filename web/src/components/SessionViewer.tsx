@@ -1,4 +1,4 @@
-import React, { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import React, { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { defaultRangeExtractor, useVirtualizer } from "@tanstack/react-virtual";
 import { useSessionStream, type TimelineItem } from "../hooks/useSessionStream";
 import { sessionService, type TodoUpdate } from "../services/session";
@@ -19,10 +19,6 @@ import { DEFAULT_REPLY_INFO_PREFERENCES, useReplyInfoPreferences } from "../serv
 import { ReplyInfoMenu } from "./ReplyInfoMenu";
 import { ForkSessionButton } from "./ForkSessionButton";
 import { SessionHeader, type SessionHeaderActions } from "./SessionHeader";
-import {
-  relatedFileStatKey,
-  useRelatedFileStats,
-} from "../hooks/useRelatedFileStats";
 
 type SessionItem = {
   key?: string;
@@ -83,10 +79,6 @@ type SessionViewerProps = SessionHeaderActions & {
   rootPath?: string | null;
   interactionMode?: "main" | "drawer";
   targetSeq?: number;
-  gitFileStatsByPath?: Record<
-    string,
-    { status: string; additions: number; deletions: number }
-  >;
   onFileClick?: (file: RelatedFile & { name?: string }) => void;
   onRootClick?: (rootId: string) => void;
   onRemoveRelatedFile?: (path: string, head?: string, repoPath?: string, repoKind?: string) => void;
@@ -96,7 +88,7 @@ type SessionViewerProps = SessionHeaderActions & {
     agent?: string;
     toolUseId: string;
     answers: Record<string, string>;
-  }) => void | Promise<void>;
+  }) => boolean | void | Promise<boolean | void>;
   onEditUserMessage?: (content: string) => void;
   onForkAgentMessage?: (seq: number, independent: boolean) => void | Promise<void>;
   targetSeqRequestKey?: string | number;
@@ -355,18 +347,24 @@ function ContextWindowBadge({
   contextWindow?: { totalTokens: number; modelContextWindow: number };
 }) {
   const metrics = formatContextWindowPercent(contextWindow);
-  if (!metrics) {
+  const usedTokens = Math.max(0, Number(contextWindow?.totalTokens || 0));
+  if (!metrics && !usedTokens) {
     return null;
   }
-  const hue =
-    metrics.percent >= 90
+  const hue = !metrics
+    ? "var(--text-secondary)"
+    : metrics.percent >= 90
       ? "#dc2626"
       : metrics.percent >= 75
         ? "#ea580c"
         : "#0f766e";
   return (
     <span
-      title={`Context Window ${metrics.percent}% used (${metrics.usedTokens}/${contextWindow?.modelContextWindow} used)`}
+      title={
+        metrics
+          ? `Context Window ${metrics.percent}% used (${metrics.usedTokens}/${contextWindow?.modelContextWindow} used)`
+          : `Context used ${formatCompactTokenCount(usedTokens)} (model window not reported yet)`
+      }
       style={{
         display: "inline-flex",
         alignItems: "center",
@@ -382,13 +380,19 @@ function ContextWindowBadge({
         overflowWrap: "anywhere",
       }}
     >
-      <span>{metrics.percent}%</span>
-      <span>&middot;used</span>
-      <span>
-        {`(${formatCompactTokenCount(metrics.usedTokens)}/${formatCompactTokenCount(
-          contextWindow?.modelContextWindow || 0,
-        )})`}
-      </span>
+      {metrics ? (
+        <>
+          <span>{metrics.percent}%</span>
+          <span>&middot;used</span>
+          <span>
+            {`(${formatCompactTokenCount(metrics.usedTokens)}/${formatCompactTokenCount(
+              contextWindow?.modelContextWindow || 0,
+            )})`}
+          </span>
+        </>
+      ) : (
+        <span>{formatCompactTokenCount(usedTokens)}</span>
+      )}
     </span>
   );
 }
@@ -688,6 +692,29 @@ function ForkIcon() {
   );
 }
 
+// Ask-user cards are virtualized and can unmount while the server is still
+// persisting an accepted answer. Keep submitted answers for the lifetime of
+// the page so a remount does not reopen the form and invite a duplicate answer.
+const submittedAskUserAnswers = new Map<string, Record<string, string>>();
+const submittedAskUserAnswersLimit = 200;
+
+function submittedAskUserAnswersFor(key: string): Record<string, string> | undefined {
+  return key ? submittedAskUserAnswers.get(key) : undefined;
+}
+
+function rememberSubmittedAskUserAnswers(key: string, answers: Record<string, string>) {
+  if (!key) {
+    return;
+  }
+  submittedAskUserAnswers.set(key, { ...answers });
+  if (submittedAskUserAnswers.size > submittedAskUserAnswersLimit) {
+    const oldest = submittedAskUserAnswers.keys().next().value;
+    if (oldest) {
+      submittedAskUserAnswers.delete(oldest);
+    }
+  }
+}
+
 function AskUserQuestionCard({
   toolCall,
   rootId,
@@ -707,6 +734,7 @@ function AskUserQuestionCard({
   const questions = getAskUserQuestions(toolCall);
   const [focusedCustomAnswerKey, setFocusedCustomAnswerKey] = useState("");
   const [submitting, setSubmitting] = useState(false);
+  const [submitError, setSubmitError] = useState("");
   const status = `${toolCall.status || ""}`.toLowerCase();
   const isCurrent =
     status === "running" || status === "pending" || status === "in_progress";
@@ -717,8 +745,16 @@ function AskUserQuestionCard({
   const persistedAnswers = getAskUserAnswers(toolCall);
   const persistedAnswersKey = JSON.stringify(persistedAnswers);
   const hasPersistedAnswers = Object.keys(persistedAnswers).length > 0;
-  const [answers, setAnswers] = useState<Record<string, string>>(persistedAnswers);
-  const [submitted, setSubmitted] = useState(hasPersistedAnswers);
+  const answerStateKey =
+    rootId && sessionKey && toolUseId
+      ? `${rootId}::${sessionKey}::${toolUseId}`
+      : "";
+  const cachedAnswers = submittedAskUserAnswersFor(answerStateKey);
+  const [answers, setAnswers] = useState<Record<string, string>>(
+    cachedAnswers || persistedAnswers,
+  );
+  const [submitted, setSubmitted] = useState(hasPersistedAnswers || !!cachedAnswers);
+  const answerStateKeyRef = useRef(answerStateKey);
   const firstQuestionTitle = askUserQuestionTitle(questions[0]);
   const title =
     firstQuestionTitle ||
@@ -736,15 +772,28 @@ function AskUserQuestionCard({
     !submitted;
 
   useEffect(() => {
+    const keyChanged = answerStateKeyRef.current !== answerStateKey;
+    answerStateKeyRef.current = answerStateKey;
     if (hasPersistedAnswers) {
+      rememberSubmittedAskUserAnswers(answerStateKey, persistedAnswers);
       setAnswers(persistedAnswers);
       setSubmitted(true);
       setExpanded(false);
       return;
     }
-    setAnswers({});
-    setSubmitted(false);
-  }, [toolUseId, persistedAnswersKey, hasPersistedAnswers]);
+    const cached = submittedAskUserAnswersFor(answerStateKey);
+    if (cached) {
+      setAnswers(cached);
+      setSubmitted(true);
+      setExpanded(false);
+      return;
+    }
+    if (keyChanged) {
+      setAnswers({});
+      setSubmitted(false);
+      setSubmitError("");
+    }
+  }, [answerStateKey, persistedAnswersKey, hasPersistedAnswers]);
 
   useEffect(() => {
     if (submitted) {
@@ -980,10 +1029,26 @@ function AskUserQuestionCard({
           onClick={async () => {
             if (!canSubmit || !rootId || !sessionKey || !toolUseId || !onAnswer) return;
             setSubmitting(true);
+            setSubmitError("");
             try {
-              await onAnswer({ rootId, sessionKey, agent, toolUseId, answers });
+              const accepted = await onAnswer({
+                rootId,
+                sessionKey,
+                agent,
+                toolUseId,
+                answers,
+              });
+              if (accepted === false) {
+                setSubmitError(t("session.askSubmitFailed"));
+                return;
+              }
+              rememberSubmittedAskUserAnswers(answerStateKey, answers);
               setSubmitted(true);
               setExpanded(false);
+            } catch (err) {
+              setSubmitError(
+                String((err as Error)?.message || "") || t("session.askSubmitFailed"),
+              );
             } finally {
               setSubmitting(false);
             }
@@ -1002,6 +1067,9 @@ function AskUserQuestionCard({
         >
           {submitted ? t("session.askSubmitted") : submitting ? t("session.askSubmitting") : t("session.askSubmit")}
         </button>
+        {submitError ? (
+          <span style={{ fontSize: "12px", color: "#dc2626" }}>{submitError}</span>
+        ) : null}
         </div>
       ) : null}
     </div>
@@ -1054,6 +1122,15 @@ function UserMessageListIcon() {
   );
 }
 
+// The summary/jump controls float over the lower-right corner of the
+// transcript. Reserve enough tail padding for the last message to clear them
+// when the view is scrolled to the bottom; while scrolling, content stays
+// visible around the controls.
+const SESSION_TAIL_CONTROLS_OFFSET = 16;
+const SESSION_TAIL_CONTROLS_SIZE = 34;
+const SESSION_TAIL_CONTROLS_BADGE_OVERHANG = 7;
+const SESSION_TAIL_CONTROLS_GAP = 8;
+
 function SessionViewerInner({
   session,
   loading = false,
@@ -1063,7 +1140,6 @@ function SessionViewerInner({
   interactionMode = "main",
   targetSeq = 0,
   targetSeqRequestKey = "",
-  gitFileStatsByPath = {},
   onFileClick,
   onRootClick,
   onRemoveRelatedFile,
@@ -1079,6 +1155,12 @@ function SessionViewerInner({
   onScheduledTask,
 }: SessionViewerProps) {
   const { locale, t } = useI18n();
+  const sessionTailPaddingBottom =
+    SESSION_TAIL_CONTROLS_OFFSET +
+    composerOverlayInset +
+    SESSION_TAIL_CONTROLS_SIZE +
+    SESSION_TAIL_CONTROLS_BADGE_OVERHANG +
+    SESSION_TAIL_CONTROLS_GAP;
   const [relatedFilesCollapsed, setRelatedFilesCollapsed] = useState(false);
   const [isMobile, setIsMobile] = useState(() => {
     if (typeof window === "undefined") {
@@ -1101,6 +1183,14 @@ function SessionViewerInner({
   const relatedFilesDefaultStateRef = useRef<string>("");
   const userSummaryRootRef = useRef<HTMLDivElement | null>(null);
   const userSummaryListRef = useRef<HTMLDivElement | null>(null);
+  // The transcript swaps between the regular list and the virtualizer at 100
+  // items. That swap rebuilds the scroll body from size estimates; keep the
+  // measured row heights and the reading offset so the viewport survives it.
+  const nonVirtualItemHeightsRef = useRef<Map<number, number> | null>(null);
+  const lastKnownScrollTopRef = useRef(0);
+  const pendingScrollRestoreRef = useRef<number | null>(null);
+  const pendingScrollRestoreDeadlineRef = useRef(0);
+  const previousVirtualizedRef = useRef<boolean | null>(null);
   const sessionKey = session?.key || session?.session_key || null;
   const [editingMessage, setEditingMessage] = useState<{ seq: number; original: string; timestamp: string; content: string } | null>(null);
   const [savingEdit, setSavingEdit] = useState(false);
@@ -1141,6 +1231,7 @@ function SessionViewerInner({
     isAwaiting,
   );
   const shouldStickToBottomRef = useRef(true);
+  const lastPendingUserKeyRef = useRef("");
   const latestUserIndex = timeline.reduce((last, item, index) => item.type === "user_text" ? index : last, -1);
   const latestCompletedReplyIndex = useMemo(() => {
     for (let index = timeline.length - 1; index >= 0; index--) {
@@ -1206,6 +1297,104 @@ function SessionViewerInner({
     },
   });
 
+  // Capture real row heights while the regular list is mounted. When the
+  // timeline crosses into virtualization those measurements seed the
+  // virtualizer, so its scroll body keeps the existing height instead of
+  // collapsing to estimates.
+  useLayoutEffect(() => {
+    // Only sessions near the virtualization threshold need the measurement;
+    // shorter ones never swap layouts.
+    if (virtualized || timeline.length < 80) {
+      return;
+    }
+    const container = scrollRef.current;
+    if (!container || !scrollEndRef.current) {
+      return;
+    }
+    const heights = new Map<number, number>();
+    container.querySelectorAll<HTMLElement>("[data-timeline-index]").forEach((node) => {
+      const index = Number(node.dataset.timelineIndex || "");
+      if (!Number.isInteger(index) || index < 0) {
+        return;
+      }
+      const marginTop = Number.parseFloat(node.style.marginTop || "0") || 0;
+      heights.set(index, Math.ceil(node.getBoundingClientRect().height + marginTop));
+    });
+    nonVirtualItemHeightsRef.current = heights;
+    lastKnownScrollTopRef.current = container.scrollTop;
+  });
+
+  useLayoutEffect(() => {
+    const wasVirtualized = previousVirtualizedRef.current;
+    previousVirtualizedRef.current = virtualized;
+    if (wasVirtualized === null || wasVirtualized === virtualized) {
+      return;
+    }
+    if (shouldStickToBottomRef.current) {
+      // Following the tail re-anchors itself; only a reading gesture needs
+      // the viewport preserved across the layout swap.
+      pendingScrollRestoreRef.current = null;
+      return;
+    }
+    if (virtualized) {
+      const heights = nonVirtualItemHeightsRef.current;
+      heights?.forEach((height, index) => {
+        if (index < timeline.length) {
+          virtualizer.resizeItem(index, height);
+        }
+      });
+    }
+    pendingScrollRestoreRef.current = lastKnownScrollTopRef.current;
+    pendingScrollRestoreDeadlineRef.current = performance.now() + 600;
+  }, [virtualized, virtualizer, timeline.length]);
+
+  useLayoutEffect(() => {
+    const target = pendingScrollRestoreRef.current;
+    if (target === null) {
+      return;
+    }
+    if (shouldStickToBottomRef.current) {
+      pendingScrollRestoreRef.current = null;
+      return;
+    }
+    const container = scrollRef.current;
+    if (!container) {
+      return;
+    }
+    let cancelled = false;
+    let frame: number | null = null;
+    let attempts = 0;
+    // The virtualizer publishes the seeded row sizes on a follow-up render.
+    // Wait for that height before writing the offset; writing while the sizer
+    // still uses estimates clamps to the estimated bottom and re-enables
+    // following, which is the jump this restore exists to prevent.
+    const restore = () => {
+      if (cancelled || pendingScrollRestoreRef.current === null) {
+        return;
+      }
+      if (shouldStickToBottomRef.current) {
+        pendingScrollRestoreRef.current = null;
+        return;
+      }
+      attempts += 1;
+      const maxTop = Math.max(0, container.scrollHeight - container.clientHeight);
+      const settled = performance.now() >= pendingScrollRestoreDeadlineRef.current;
+      if (virtualized && !settled && maxTop < target && attempts < 24) {
+        frame = window.requestAnimationFrame(restore);
+        return;
+      }
+      container.scrollTop = Math.min(target, maxTop);
+      pendingScrollRestoreRef.current = null;
+    };
+    restore();
+    return () => {
+      cancelled = true;
+      if (frame !== null) {
+        window.cancelAnimationFrame(frame);
+      }
+    };
+  });
+
   const cancelTargetSeqScroll = () => {
     if (targetSeqFrameRef.current !== null) {
       window.cancelAnimationFrame(targetSeqFrameRef.current);
@@ -1221,8 +1410,69 @@ function SessionViewerInner({
       return;
     }
     const maxTop = Math.max(0, container.scrollHeight - container.clientHeight);
+    lastKnownScrollTopRef.current = maxTop;
     container.scrollTo({ top: maxTop, behavior });
   };
+
+  // Expanding a card is a reading gesture. Stop tail-following so the added
+  // content (and later stream updates) cannot drag the viewport back down.
+  const pauseSessionFollowing = useCallback(() => {
+    shouldStickToBottomRef.current = false;
+    if (targetSeqFrameRef.current !== null) {
+      window.cancelAnimationFrame(targetSeqFrameRef.current);
+      targetSeqFrameRef.current = null;
+    }
+    targetSeqTimerRefs.current.forEach((timer) => window.clearTimeout(timer));
+    targetSeqTimerRefs.current = [];
+    if (viewportStickFrameRef.current !== null) {
+      window.cancelAnimationFrame(viewportStickFrameRef.current);
+      viewportStickFrameRef.current = null;
+    }
+    // The expanded card moves the tail away without producing a scroll event;
+    // surface the jump button now that following is paused.
+    window.requestAnimationFrame(() => {
+      const container = scrollRef.current;
+      if (!container || shouldStickToBottomRef.current) {
+        return;
+      }
+      const distanceFromBottom = container.scrollHeight - container.clientHeight - container.scrollTop;
+      if (distanceFromBottom > 40) {
+        setShowJumpToLatest(true);
+      }
+    });
+  }, []);
+
+  // Sending a message always returns the view to the tail, even when the user
+  // had scrolled up to read history. The optimistic user exchange carries
+  // pending_ack until the server acknowledges it, which makes it a precise
+  // "user just sent this" signal (unlike history loads or edits).
+  useEffect(() => {
+    let pendingUserId = "";
+    for (let index = timeline.length - 1; index >= 0; index -= 1) {
+      const item = timeline[index];
+      if (item.type === "user_text" && item.pendingAck) {
+        pendingUserId = item.id;
+        break;
+      }
+    }
+    if (!pendingUserId) {
+      return;
+    }
+    const key = `${sessionKey || ""}:${pendingUserId}`;
+    if (lastPendingUserKeyRef.current === key) {
+      return;
+    }
+    lastPendingUserKeyRef.current = key;
+    cancelTargetSeqScroll();
+    shouldStickToBottomRef.current = true;
+    setShowJumpToLatest(false);
+    const frame = window.requestAnimationFrame(() => {
+      if (shouldStickToBottomRef.current) {
+        stickSessionToBottom("auto");
+      }
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [timeline, sessionKey]);
 
   useEffect(() => {
     onFileClickRef.current = onFileClick;
@@ -1497,16 +1747,45 @@ function SessionViewerInner({
     }
     let lastScrollTop = el.scrollTop;
     let lastScrollHeight = el.scrollHeight;
-    let lastClientHeight = el.clientHeight;
     let touchY: number | null = null;
+    let settleTimer: number | null = null;
+    // Finger jitter and sub-pixel scroll positions can leave a few pixels of
+    // slack at the tail; treat that as bottom rather than pausing following.
+    const bottomSlop = 8;
+    const atBottom = () => el.scrollHeight - el.clientHeight - el.scrollTop <= bottomSlop;
+    const resumeFollowingAtBottom = () => {
+      if (!atBottom()) {
+        return;
+      }
+      shouldStickToBottomRef.current = true;
+      setShowJumpToLatest(false);
+    };
+    const settleFollowing = () => {
+      if (settleTimer !== null) {
+        window.clearTimeout(settleTimer);
+      }
+      settleTimer = window.setTimeout(() => {
+        settleTimer = null;
+        resumeFollowingAtBottom();
+      }, 150);
+    };
     const pauseFollowing = () => {
       shouldStickToBottomRef.current = false;
-      setShowJumpToLatest(true);
+      // A fresh gesture owns the viewport; don't fight it with a pending
+      // layout-swap restore.
+      pendingScrollRestoreRef.current = null;
+      // Touching or wheeling at the tail can pause following without moving
+      // the view. Only surface the jump button once the content is away from
+      // the bottom.
+      setShowJumpToLatest(!atBottom());
       cancelTargetSeqScroll();
       if (viewportStickFrameRef.current !== null) {
         window.cancelAnimationFrame(viewportStickFrameRef.current);
         viewportStickFrameRef.current = null;
       }
+      // Re-check after the gesture settles so a jittery or lateral swipe at
+      // the tail does not strand following in the paused state.
+      settleFollowing();
     };
     const onWheel = (event: WheelEvent) => {
       if (event.deltaY < 0) pauseFollowing();
@@ -1516,8 +1795,9 @@ function SessionViewerInner({
     };
     const onTouchMove = (event: TouchEvent) => {
       const nextY = event.touches.length === 1 ? event.touches[0].clientY : null;
-      // Moving the finger down scrolls toward older messages.
-      if (touchY !== null && nextY !== null && nextY > touchY) pauseFollowing();
+      // Moving the finger down scrolls toward older messages. Ignore
+      // sub-pixel jitter and mostly lateral swipes.
+      if (touchY !== null && nextY !== null && nextY - touchY >= 2) pauseFollowing();
       touchY = nextY;
     };
     const onTouchEnd = () => { touchY = null; };
@@ -1530,12 +1810,23 @@ function SessionViewerInner({
       const isNearBottom = distanceFromBottom < 40;
       const movedUp = el.scrollTop < lastScrollTop;
       const movedDown = el.scrollTop > lastScrollTop;
-      const geometryChanged = el.scrollHeight !== lastScrollHeight || el.clientHeight !== lastClientHeight;
-      // Upward motion wins even inside the bottom threshold. Stationary
-      // measurements must not resume following after a wheel/touch gesture.
-      // Measuring a virtual row can shrink the document and clamp scrollTop;
-      // that is not an upward reading gesture.
-      if (movedUp && !geometryChanged) {
+      const contentShrank = el.scrollHeight < lastScrollHeight;
+      // The tail wins over direction: an iOS overscroll bounce reports upward
+      // movement while the view is still at (or beyond) the bottom, and the
+      // bounce must not pause following or surface the jump button. Resuming
+      // here also hides the button as soon as the bounce returns to the tail
+      // instead of waiting for the settle timer.
+      if (rawDistanceFromBottom <= bottomSlop) {
+        shouldStickToBottomRef.current = true;
+      } else if (movedUp && !contentShrank) {
+        // Upward motion wins outside the tail threshold. Stationary
+        // measurements must not resume following after a wheel/touch gesture.
+        // Measuring a virtual row can shrink the document and clamp scrollTop;
+        // that is not an upward reading gesture. Growth is different: a
+        // scrollbar/keyboard scroll while the reply streams must still pause
+        // following, or the next chunk (for example the context stats) drags
+        // the viewport back to the tail.
+        pendingScrollRestoreRef.current = null;
         shouldStickToBottomRef.current = false;
       } else if (movedDown && isNearBottom) {
         shouldStickToBottomRef.current = true;
@@ -1544,7 +1835,10 @@ function SessionViewerInner({
       refreshCurrentUserMessageIndex();
       lastScrollTop = el.scrollTop;
       lastScrollHeight = el.scrollHeight;
-      lastClientHeight = el.clientHeight;
+      lastKnownScrollTopRef.current = el.scrollTop;
+      // Safety net for pauses that never produce another scroll event;
+      // scroll events at the tail already resume following above.
+      settleFollowing();
     };
     updateStickiness();
     // Observe intent and position before virtualizer scroll callbacks rerender.
@@ -1556,6 +1850,10 @@ function SessionViewerInner({
     el.addEventListener("touchend", onTouchEnd, options);
     el.addEventListener("touchcancel", onTouchEnd, options);
     return () => {
+      if (settleTimer !== null) {
+        window.clearTimeout(settleTimer);
+        settleTimer = null;
+      }
       el.removeEventListener("scroll", updateStickiness, true);
       el.removeEventListener("wheel", onWheel, true);
       el.removeEventListener("touchstart", onTouchStart, true);
@@ -1662,15 +1960,6 @@ function SessionViewerInner({
       return { path, name, head, repo_path: repoPath, repo_name: repoName, repo_kind: repoKind, root_id: rootID };
     })
     .filter((f) => f.path);
-  const gitStatsRefreshKey = Object.entries(gitFileStatsByPath)
-    .sort(([left], [right]) => left.localeCompare(right))
-    .map(([path, stats]) => `${path}:${stats.status}:${stats.additions}:${stats.deletions}`)
-    .join("|");
-  const relatedFileStatsByKey = useRelatedFileStats(
-    rootId,
-    relatedFiles,
-    gitStatsRefreshKey,
-  );
   const activeAskUserCallId = (() => {
     if (!isAwaiting) {
       return "";
@@ -1751,7 +2040,9 @@ function SessionViewerInner({
       (!!currentRootPath && normalizedRepoPath === currentRootPath);
     const repoPath = isCurrentRepoRecord ? "" : rawRepoPath;
     const rawRepoKind = file.repo_kind || "";
-    const repoKind = isCurrentRepoRecord && rawRepoKind !== "plain" ? "" : rawRepoKind;
+    const repoKind = isCurrentRepoRecord && rawRepoKind !== "plain" && rawRepoKind !== "svn"
+      ? ""
+      : rawRepoKind;
     const repoKey = `${repoKind}\0${repoPath}`;
     let repoGroup = groups.find((group) => group.key === repoKey);
     if (!repoGroup) {
@@ -1834,7 +2125,10 @@ function SessionViewerInner({
           <ThinkingBlock
             content={item.content || ""}
             defaultExpanded={toolViewCache.expanded.get(`thought:${timelineItemKey}`) ?? false}
-            onExpandedChange={(expanded) => toolViewCache.expanded.set(`thought:${timelineItemKey}`, expanded)}
+            onExpandedChange={(expanded) => {
+              toolViewCache.expanded.set(`thought:${timelineItemKey}`, expanded);
+              if (expanded) pauseSessionFollowing();
+            }}
           />
         </div>
       );
@@ -1882,6 +2176,7 @@ function SessionViewerInner({
               rootId={rootId}
               sessionKey={sessionKey}
               defaultExpanded={isUserShell}
+              onExpand={pauseSessionFollowing}
             />
           )}
         </div>
@@ -1948,7 +2243,14 @@ function SessionViewerInner({
     const assistantDurationLabel = !isUser
       ? formatSessionDuration(timelineNavigation.rows[idx].previousUserTime, item.timestamp)
       : "";
-    const canForkAgentMessage = !isUser && Number(item.seq || 0) > 0 && !!onForkAgentMessage;
+    // Forking needs a server-assigned seq. Streaming replies only exist in the
+    // client cache until the turn is persisted, so their inferred seq would be
+    // rejected by the fork endpoint with "message not found".
+    const canForkAgentMessage =
+      !isUser &&
+      item.persisted === true &&
+      Number(item.seq || 0) > 0 &&
+      !!onForkAgentMessage;
     const canEditInPlace = isUser && idx === latestUserIndex && !item.pendingAck && !!item.timestamp && session?.type === "chat" && !(session as any)?.closed_at;
     const isEditing = isUser && editingMessage?.timestamp === item.timestamp && editingMessage?.original === item.content;
     return (
@@ -2711,7 +3013,7 @@ function SessionViewerInner({
             width: "100%",
             minWidth: 0,
             display: "block",
-            padding: "24px 16px",
+            padding: `24px 16px ${sessionTailPaddingBottom}px`,
             boxSizing: "border-box",
             overflowX: "hidden",
           }} data-mindfs-session-content-width="1">
@@ -2762,10 +3064,13 @@ function SessionViewerInner({
                 ))}
               </div>
             ) : timeline.map((item, idx) =>
-              renderTimelineItem(
-                item,
-                idx,
-                timelineItemSpacing(idx > 0 ? timeline[idx - 1] : null, item),
+              React.cloneElement(
+                renderTimelineItem(
+                  item,
+                  idx,
+                  timelineItemSpacing(idx > 0 ? timeline[idx - 1] : null, item),
+                ),
+                { "data-timeline-index": idx } as any,
               ),
             )}
             {renderSlashCommandResult()}
@@ -2932,17 +3237,20 @@ function SessionViewerInner({
                             >
                               {group.repoKind === "plain"
                                 ? `${group.repoName || t("session.currentProject")} · ${t("session.nonGit")}`
-                                : group.head
-                                  ? isCurrentRepo
-                                    ? `HEAD ${group.head.slice(0, 8)}`
-                                    : `${group.repoName || t("session.currentProject")} · HEAD ${group.head.slice(0, 8)}`
-                                  : group.repoName || t("session.currentProject")}
+                                : group.repoKind === "svn"
+                                  ? group.head && group.head !== "0"
+                                    ? isCurrentRepo
+                                      ? t("session.svnRevision", { revision: group.head })
+                                      : `${group.repoName || t("session.currentProject")} · ${t("session.svnRevision", { revision: group.head })}`
+                                    : group.repoName || t("session.currentProject")
+                                  : group.head
+                                    ? isCurrentRepo
+                                      ? `HEAD ${group.head.slice(0, 8)}`
+                                      : `${group.repoName || t("session.currentProject")} · HEAD ${group.head.slice(0, 8)}`
+                                    : group.repoName || t("session.currentProject")}
                             </div>
                           ) : null}
                           {group.files.map((file) => {
-                            const stats =
-                              relatedFileStatsByKey[relatedFileStatKey(file)] ||
-                              gitFileStatsByPath[file.path];
                             return (
                           <div
                             key={`${file.head || "legacy"}:${file.path}`}
@@ -3006,35 +3314,6 @@ function SessionViewerInner({
                               >
                                 {file.name}
                               </div>
-                              {stats ? (
-                                <div
-                                  style={{
-                                    display: "inline-flex",
-                                    alignItems: "center",
-                                    gap: "8px",
-                                    fontSize: "11px",
-                                    color: "var(--text-secondary)",
-                                    flexShrink: 0,
-                                  }}
-                                >
-                                  <span
-                                    style={{
-                                      color: "#15803d",
-                                      fontVariantNumeric: "tabular-nums",
-                                    }}
-                                  >
-                                    +{stats.additions}
-                                  </span>
-                                  <span
-                                    style={{
-                                      color: "#b91c1c",
-                                      fontVariantNumeric: "tabular-nums",
-                                    }}
-                                  >
-                                    -{stats.deletions}
-                                  </span>
-                                </div>
-                              ) : null}
                             </div>
                             <button
                               type="button"
@@ -3102,6 +3381,7 @@ function SessionViewerInner({
                 }}
                 aria-label={t("session.jumpLatest")}
                 title={t("session.jumpLatest")}
+                data-mindfs-jump-latest="1"
                 style={{
                   display: "inline-flex",
                   alignItems: "center",
@@ -3124,6 +3404,7 @@ function SessionViewerInner({
             {userMessageSummaries.length > 0 ? (
               <div
                 ref={userSummaryRootRef}
+                data-mindfs-user-summary="1"
                 onMouseEnter={() => {
                   refreshCurrentUserMessageIndex();
                   setUserSummaryHoverOpen(true);
@@ -3254,6 +3535,7 @@ function SessionViewerInner({
                   <UserMessageListIcon />
                   <span
                     aria-hidden="true"
+                    data-mindfs-user-summary-count="1"
                     style={{
                       position: "absolute",
                       top: "-7px",
@@ -3312,7 +3594,6 @@ export const SessionViewer = memo(
     prev.targetSeq === next.targetSeq &&
     prev.targetSeqRequestKey === next.targetSeqRequestKey &&
     prev.composerOverlayInset === next.composerOverlayInset &&
-    prev.gitFileStatsByPath === next.gitFileStatsByPath &&
     prev.onRootClick === next.onRootClick &&
     prev.onRenameSession === next.onRenameSession &&
     prev.onDeleteSession === next.onDeleteSession &&

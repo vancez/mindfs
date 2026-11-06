@@ -1,22 +1,10 @@
 import assert from "node:assert/strict";
-import { access } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { after, before, test } from "node:test";
 import { chromium } from "playwright-core";
 import { createServer } from "vite";
+import { findBrowserExecutable, getFreePort } from "./browserExecutable.mjs";
 
-const browserPaths =
-  process.platform === "darwin"
-    ? [
-        "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
-        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-      ]
-    : [
-        "/opt/google/chrome/chrome",
-        "/usr/bin/chromium",
-        "/usr/bin/google-chrome",
-        "/usr/bin/google-chrome-stable",
-      ];
 
 const fixtureRoot = fileURLToPath(new URL("./lexical-ime", import.meta.url));
 
@@ -25,20 +13,12 @@ let browser;
 let browserPath;
 
 before(async () => {
-  for (const candidate of browserPaths) {
-    try {
-      await access(candidate);
-      browserPath = candidate;
-      break;
-    } catch {
-      // 按平台选择已安装的 Chromium；不下载测试浏览器。
-    }
-  }
+  browserPath = await findBrowserExecutable();
   assert.ok(browserPath, "This E2E requires an installed Chromium browser");
   server = await createServer({
     configFile: false,
     root: fixtureRoot,
-    server: { host: "127.0.0.1", port: 0 },
+    server: { host: "127.0.0.1", port: await getFreePort() },
   });
   await server.listen();
   browser = await chromium.launch({

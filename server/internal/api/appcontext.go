@@ -27,6 +27,7 @@ import (
 	"mindfs/server/internal/relay"
 	"mindfs/server/internal/scheduled"
 	"mindfs/server/internal/session"
+	"mindfs/server/internal/svnview"
 	"mindfs/server/internal/update"
 	"mindfs/server/internal/webpush"
 )
@@ -352,17 +353,17 @@ func (s *AppContext) RunAgentStage(ctx context.Context, exec kanban.AgentStageEx
 			s.BroadcastAgentStatusChanged(agentName)
 		},
 		OnSubSessionCreated: func(created *session.Session) {
-			s.BroadcastSessionMetaUpdated(exec.RootID, created)
 			if created != nil {
 				s.SetSessionPendingReply(exec.RootID, created.Key, created.Name)
 			}
+			s.BroadcastSessionMetaUpdated(exec.RootID, created)
 		},
 		OnSubSessionUpdate: func(sessionKey string, update agenttypes.Event) {
 			updateTracker.Begin()
 			defer updateTracker.End()
 			s.BroadcastSessionUpdate(exec.RootID, sessionKey, update)
 			if update.Type == agenttypes.EventTypeMessageDone {
-				s.BroadcastSessionDone(exec.RootID, sessionKey, "")
+				s.BroadcastSubSessionDone(exec.RootID, sessionKey)
 			}
 		},
 	})
@@ -418,36 +419,44 @@ func resolveRelatedWorktree(ctx context.Context, root fs.RootInfo, filePath stri
 		cleanPath = filepath.Join(root.RootPath, cleanPath)
 	}
 	cleanPath = filepath.Clean(cleanPath)
-	worktrees, err := gitview.ListWorktrees(ctx, root.RootPath)
-	if err != nil {
-		return fs.RelatedWorktreeMatch{}, false
-	}
-	var best fs.RelatedWorktreeMatch
-	bestPathLen := -1
-	for _, item := range worktrees.Items {
-		if !pathInsideDir(cleanPath, item.Path) {
-			continue
+	if hasGitMetadataAncestor(cleanPath) {
+		if worktrees, err := gitview.ListWorktrees(ctx, root.RootPath); err == nil {
+			var best fs.RelatedWorktreeMatch
+			bestPathLen := -1
+			for _, item := range worktrees.Items {
+				if !pathInsideDir(cleanPath, item.Path) {
+					continue
+				}
+				candidate := fs.RelatedWorktreeMatch{
+					Path:    item.Path,
+					Branch:  item.Branch,
+					Head:    item.Head,
+					Current: item.Current,
+				}
+				pathLen := len(filepath.Clean(item.Path))
+				if pathLen > bestPathLen {
+					best = candidate
+					bestPathLen = pathLen
+				}
+			}
+			if bestPathLen >= 0 {
+				return best, true
+			}
 		}
-		candidate := fs.RelatedWorktreeMatch{
-			Path:    item.Path,
-			Branch:  item.Branch,
-			Head:    item.Head,
-			Current: item.Current,
-		}
-		pathLen := len(filepath.Clean(item.Path))
-		if pathLen > bestPathLen {
-			best = candidate
-			bestPathLen = pathLen
+		if repo, err := gitview.ResolveRepositoryForPath(ctx, cleanPath); err == nil && strings.TrimSpace(repo.Path) != "" {
+			return fs.RelatedWorktreeMatch{
+				Path:    filepath.Clean(repo.Path),
+				Head:    strings.TrimSpace(repo.Head),
+				Current: pathInsideDir(cleanPath, root.RootPath),
+			}, true
 		}
 	}
-	if bestPathLen >= 0 {
-		return best, true
-	}
-	if repo, err := gitview.ResolveRepositoryForPath(ctx, cleanPath); err == nil && strings.TrimSpace(repo.Path) != "" {
+	if revision, ok := svnview.FileRevision(ctx, root.RootPath, cleanPath); ok {
 		return fs.RelatedWorktreeMatch{
-			Path:    filepath.Clean(repo.Path),
-			Head:    strings.TrimSpace(repo.Head),
-			Current: pathInsideDir(cleanPath, root.RootPath),
+			Path:     filepath.Clean(root.RootPath),
+			Head:     strings.TrimSpace(revision),
+			Current:  true,
+			RepoKind: "svn",
 		}, true
 	}
 	return fs.RelatedWorktreeMatch{}, false
@@ -459,6 +468,27 @@ func cleanToolFilePath(path string) string {
 		return ""
 	}
 	return filepath.Clean(path)
+}
+
+func hasGitMetadataAncestor(path string) bool {
+	path = filepath.Clean(strings.TrimSpace(path))
+	if path == "" {
+		return false
+	}
+	start := path
+	if stat, err := os.Stat(path); err != nil || !stat.IsDir() {
+		start = filepath.Dir(path)
+	}
+	for {
+		if _, err := os.Stat(filepath.Join(start, ".git")); err == nil {
+			return true
+		}
+		parent := filepath.Dir(start)
+		if parent == start {
+			return false
+		}
+		start = parent
+	}
 }
 
 func pathInsideDir(path, dir string) bool {
@@ -606,6 +636,9 @@ func (s *AppContext) RemoveRoot(path string) (fs.RootInfo, error) {
 	rootCtx := s.roots[dir.ID]
 	delete(s.roots, dir.ID)
 	s.mu.Unlock()
+	if s.Kanban != nil {
+		s.Kanban.CloseRoot(dir.ID)
+	}
 	if rootCtx != nil && rootCtx.Watcher != nil {
 		rootCtx.Watcher.Close()
 	}
@@ -627,6 +660,9 @@ func (s *AppContext) ReleaseRootResources(rootID string) {
 	rootCtx := s.roots[rootID]
 	delete(s.roots, rootID)
 	s.mu.Unlock()
+	if s.Kanban != nil {
+		s.Kanban.CloseRoot(rootID)
+	}
 	if rootCtx == nil {
 		return
 	}
@@ -792,6 +828,7 @@ func (s *AppContext) BroadcastSessionMetaUpdated(rootID string, sess *session.Se
 				"fast_service":        session.InferFastServiceFromSession(sess),
 				"plan_mode":           sess.PlanMode,
 				"related_worktree":    sess.RelatedWorktree,
+				"pending":             s.GetSessionStreamHub().SessionPending(sess.Key),
 				"updated_at":          sess.UpdatedAt,
 			},
 		},
@@ -896,14 +933,50 @@ func (s *AppContext) UpdateTaskSessionErrorForSession(rootID, sessionKey, messag
 }
 
 func (s *AppContext) BroadcastSessionDone(rootID, sessionKey, requestID string) {
+	s.completeSession(rootID, sessionKey, requestID, true)
+}
+
+// BroadcastSubSessionDone finishes a child (subagent) session. The done event
+// still reaches open clients, but it does not raise a standalone notification:
+// subagent completions would otherwise push once per child on top of the
+// parent's own done notification. Subagent AskUserQuestion notifications keep
+// flowing through BroadcastSessionUpdate.
+func (s *AppContext) BroadcastSubSessionDone(rootID, sessionKey string) {
+	s.completeSession(rootID, sessionKey, "", false)
+	// The child's own stream/done events only reach clients viewing that child.
+	// Broadcast the metadata so every open session list sees the reply
+	// indicator clear without having to open the child first.
+	manager, err := s.GetSessionManager(rootID)
+	if err != nil {
+		return
+	}
+	child, err := manager.Get(context.Background(), sessionKey, 0)
+	if err != nil || child == nil {
+		return
+	}
+	s.BroadcastSessionMetaUpdated(rootID, child)
+}
+
+func (s *AppContext) completeSession(rootID, sessionKey, requestID string, notifyDone bool) {
 	hub := s.GetSessionStreamHub()
 	pending := hub.PendingSessionSnapshot(sessionKey)
-	s.notifySessionDone(rootID, sessionKey, requestID, pending)
+	if notifyDone {
+		sendSessionDoneNotification(s, rootID, sessionKey, requestID, pending)
+	}
 	hub.ClearSessionPending(sessionKey)
 	hub.BroadcastSessionDone(rootID, sessionKey, requestID)
+	// Bound clients learn the reply ended from session.done. Everyone else only
+	// holds a session list, so the pending flag has to be broadcast globally.
+	hub.BroadcastSessionPending(rootID, sessionKey, false)
 	if service, err := s.GetKanbanService(); err == nil {
 		service.Schedule(rootID)
 	}
+}
+
+// Package-level seam so tests can observe done notifications without wiring up
+// web push or a notification script.
+var sendSessionDoneNotification = func(s *AppContext, rootID, sessionKey, requestID string, pending PendingSessionSnapshot) {
+	s.notifySessionDone(rootID, sessionKey, requestID, pending)
 }
 
 func (s *AppContext) BroadcastScheduledTaskDone(rootID, taskID, taskName, sessionKey, summary string) {
@@ -1057,11 +1130,22 @@ func (s *AppContext) notifyPayload(ctx context.Context, eventID string, payload 
 		return
 	}
 	if s.WebPush != nil && s.WebPush.Enabled() {
-		s.WebPush.NotifyPayload(ctx, eventID, payload)
+		if s.hasFocusedClient() {
+			log.Printf("[webpush] suppress.focused event=%s type=%s", eventID, payload.Type)
+		} else {
+			s.WebPush.NotifyPayload(ctx, eventID, payload)
+		}
 	}
 	if s.Notify != nil && s.Notify.Enabled() {
 		s.Notify.NotifyPayload(ctx, payload)
 	}
+}
+
+func (s *AppContext) hasFocusedClient() bool {
+	if s == nil {
+		return false
+	}
+	return s.GetSessionStreamHub().HasFocusedClient()
 }
 
 func (s *AppContext) rootTitle(rootID string) string {

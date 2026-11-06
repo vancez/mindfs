@@ -275,16 +275,17 @@ type CommandList struct {
 type EventType string
 
 const (
-	EventTypeMessageChunk EventType = "message_chunk"
-	EventTypeThoughtChunk EventType = "thought_chunk"
-	EventTypeToolCall     EventType = "tool_call"
-	EventTypeToolUpdate   EventType = "tool_update"
-	EventTypeTodoUpdate   EventType = "todo_update"
-	EventTypePlanUpdate   EventType = "plan_update"
-	EventTypeCompact      EventType = "compact_notice"
-	EventTypeLogin        EventType = "login_notice"
-	EventTypeMessageDone  EventType = "message_done"
-	EventTypeRecovery     EventType = "recovery"
+	EventTypeMessageChunk  EventType = "message_chunk"
+	EventTypeThoughtChunk  EventType = "thought_chunk"
+	EventTypeToolCall      EventType = "tool_call"
+	EventTypeToolUpdate    EventType = "tool_update"
+	EventTypeTodoUpdate    EventType = "todo_update"
+	EventTypePlanUpdate    EventType = "plan_update"
+	EventTypeCompact       EventType = "compact_notice"
+	EventTypeLogin         EventType = "login_notice"
+	EventTypeMessageDone   EventType = "message_done"
+	EventTypeContextUpdate EventType = "context_update"
+	EventTypeRecovery      EventType = "recovery"
 )
 
 // Event is a normalized session update emitted by any agent backend.
@@ -318,6 +319,11 @@ type MessageDone struct {
 	TaskID          string        `json:"taskId,omitempty"`
 	SubagentType    string        `json:"subagentType,omitempty"`
 	TaskDescription string        `json:"taskDescription,omitempty"`
+}
+
+// ContextUpdate carries live context-window usage between turn boundaries.
+type ContextUpdate struct {
+	ContextWindow ContextWindow `json:"contextWindow"`
 }
 
 type RecoveryStatus struct {

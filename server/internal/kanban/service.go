@@ -1377,6 +1377,45 @@ func BuildAgentPrompt(template string, values map[string]string) string {
 	return out
 }
 
+// CloseRoot releases the per-root runtime state and SQLite connection held by
+// the task service. Roots can be removed or renamed while the server keeps
+// running; without this, Windows keeps task-kanban.db locked and the project
+// directory cannot be deleted.
+func (s *Service) CloseRoot(rootID string) {
+	if s == nil {
+		return
+	}
+	rootID = strings.TrimSpace(rootID)
+	if rootID == "" {
+		return
+	}
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return
+	}
+	for key, cancel := range s.executionCancels {
+		if !executionKeyBelongsToRoot(key, rootID) {
+			continue
+		}
+		cancel()
+		delete(s.executionCancels, key)
+		delete(s.running, key)
+	}
+	delete(s.scheduleRun, rootID)
+	delete(s.schedulePend, rootID)
+	store := s.stores[rootID]
+	delete(s.stores, rootID)
+	s.mu.Unlock()
+	if store != nil {
+		_ = store.Close()
+	}
+}
+
+func executionKeyBelongsToRoot(key, rootID string) bool {
+	return strings.HasPrefix(key, rootID+"/") || strings.HasPrefix(key, "group-session/"+rootID+"/")
+}
+
 // Close cancels in-flight work and waits before closing SQLite connections.
 func (s *Service) Close() {
 	s.mu.Lock()

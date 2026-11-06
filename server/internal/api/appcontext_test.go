@@ -30,6 +30,34 @@ func TestNextSessionWorktreeNameStartsAtOne(t *testing.T) {
 	}
 }
 
+func TestBroadcastSubSessionDoneSkipsNotification(t *testing.T) {
+	original := sendSessionDoneNotification
+	t.Cleanup(func() { sendSessionDoneNotification = original })
+
+	notified := make(map[string]int)
+	sendSessionDoneNotification = func(_ *AppContext, _, sessionKey, _ string, _ PendingSessionSnapshot) {
+		notified[sessionKey]++
+	}
+
+	app := &AppContext{}
+	hub := app.GetSessionStreamHub()
+
+	hub.SetPendingReply("root", "child-1", "Bash")
+	app.BroadcastSubSessionDone("root", "child-1")
+	if notified["child-1"] != 0 {
+		t.Fatalf("sub-session completion notified %d times, want 0", notified["child-1"])
+	}
+	if snapshot := hub.PendingSessionSnapshot("child-1"); snapshot.SessionTitle != "" {
+		t.Fatalf("sub-session pending state was not cleared: %#v", snapshot)
+	}
+
+	hub.SetPendingReply("root", "parent-1", "Parent")
+	app.BroadcastSessionDone("root", "parent-1", "req-1")
+	if notified["parent-1"] != 1 {
+		t.Fatalf("parent completion notified %d times, want 1", notified["parent-1"])
+	}
+}
+
 func TestListRootsRemovesDeletedManagedDirWithoutRecreatingIt(t *testing.T) {
 	parent := t.TempDir()
 	registry := fs.NewRegistry(filepath.Join(parent, "registry.json"))

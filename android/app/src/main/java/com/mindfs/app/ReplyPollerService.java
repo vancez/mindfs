@@ -85,6 +85,8 @@ public class ReplyPollerService extends Service {
     private static final String CLIENT_ID_HEADER = "X-MindFS-Client-ID";
     private static final String PROOF_HEADER = "X-MindFS-Proof";
     private static final String TS_HEADER = "X-MindFS-TS";
+    private static final String NONCE_HEADER = "X-MindFS-Nonce";
+    private static final String SEP = String.valueOf((char) 0x1f);
     private static final String PROGRESS_CHANNEL_ID = "mindfs_reply_progress_v1";
     private static final String VISIBLE_PROGRESS_CHANNEL_ID = "mindfs_reply_progress_visible_v1";
     private static final String ALERT_CHANNEL_ID = "mindfs_reply_alert_v3";
@@ -292,6 +294,8 @@ public class ReplyPollerService extends Service {
 
     private Map<String, ReplyState> fetchReplyingSessions() throws Exception {
         URL url = new URL(apiBaseUrl + "/api/replying-sessions");
+        String proofPath = requestProofPath(url);
+        String requestNonce = "";
         HttpURLConnection conn = (HttpURLConnection) url.openConnection();
         if (conn instanceof HttpsURLConnection && MainActivity.isLocalNetworkHost(url.getHost())) {
             HttpsURLConnection https = (HttpsURLConnection) conn;
@@ -317,7 +321,7 @@ public class ReplyPollerService extends Service {
             }
             conn.setRequestProperty(E2EE_HEADER, "1");
             conn.setRequestProperty(CLIENT_ID_HEADER, e2eeClientId);
-            addRequestProofHeaders(conn, "GET", url);
+            requestNonce = addRequestProofHeaders(conn, "GET", proofPath);
         }
         int status = conn.getResponseCode();
         InputStream stream = status >= 200 && status < 300 ? conn.getInputStream() : conn.getErrorStream();
@@ -330,8 +334,11 @@ public class ReplyPollerService extends Service {
             }
             throw new IllegalStateException("HTTP " + status + ": " + body);
         }
+        if (e2eeRequired && !protectedResponse) {
+            throw new IllegalStateException("e2ee_response_unprotected");
+        }
         if (protectedResponse) {
-            body = decryptProtectedBody(body);
+            body = decryptProtectedBody(body, "GET", proofPath, requestNonce);
         }
 
         JSONObject root = new JSONObject(body);
@@ -376,7 +383,7 @@ public class ReplyPollerService extends Service {
             .apply();
     }
 
-    private String decryptProtectedBody(String body) throws Exception {
+    private String decryptProtectedBody(String body, String method, String proofPath, String requestNonce) throws Exception {
         if (!hasE2EESession()) {
             throw new IllegalStateException("e2ee session missing");
         }
@@ -386,17 +393,31 @@ public class ReplyPollerService extends Service {
         byte[] ciphertext = Base64.decode(envelope.optString("ciphertext", ""), Base64.DEFAULT);
         Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
         cipher.init(Cipher.DECRYPT_MODE, new SecretKeySpec(key, "AES"), new GCMParameterSpec(128, nonce));
+        cipher.updateAAD(envelopeAAD("response", method, proofPath, requestNonce));
         byte[] plaintext = cipher.doFinal(ciphertext);
         return new String(plaintext, StandardCharsets.UTF_8);
     }
 
-    private void addRequestProofHeaders(HttpURLConnection conn, String method, URL url) throws Exception {
+    private static byte[] envelopeAAD(String direction, String method, String path, String nonce) {
+        String joined = "mindfs-envelope-v1" + SEP + direction + SEP + method + SEP + path + SEP + nonce;
+        return joined.getBytes(StandardCharsets.UTF_8);
+    }
+
+    private String addRequestProofHeaders(HttpURLConnection conn, String method, String proofPath) throws Exception {
         String ts = utcTimestamp();
-        String proofPath = requestProofPath(url);
+        String nonce = newRequestNonce();
         byte[] key = Base64.decode(e2eeTransportKey, Base64.DEFAULT);
-        String proof = buildRequestProof(key, method, proofPath, ts, e2eeClientId);
+        String proof = buildRequestProof(key, method, proofPath, ts, nonce, e2eeClientId);
         conn.setRequestProperty(TS_HEADER, ts);
+        conn.setRequestProperty(NONCE_HEADER, nonce);
         conn.setRequestProperty(PROOF_HEADER, proof);
+        return nonce;
+    }
+
+    private static String newRequestNonce() {
+        byte[] nonce = new byte[16];
+        new SecureRandom().nextBytes(nonce);
+        return Base64.encodeToString(nonce, Base64.URL_SAFE | Base64.NO_WRAP | Base64.NO_PADDING);
     }
 
     private static String utcTimestamp() {
@@ -418,8 +439,8 @@ public class ReplyPollerService extends Service {
         return query.isEmpty() ? path : path + "?" + query;
     }
 
-    private static String buildRequestProof(byte[] key, String method, String path, String ts, String clientId) throws Exception {
-        String joined = "mindfs-request-proof\u001f" + method + "\u001f" + path + "\u001f" + ts + "\u001f" + clientId;
+    private static String buildRequestProof(byte[] key, String method, String path, String ts, String nonce, String clientId) throws Exception {
+        String joined = "mindfs-request-proof\u001f" + method + "\u001f" + path + "\u001f" + ts + "\u001f" + nonce + SEP + clientId;
         MessageDigest digest = MessageDigest.getInstance("SHA-256");
         byte[] sum = digest.digest(joined.getBytes(StandardCharsets.UTF_8));
         Mac hmac = Mac.getInstance("HmacSHA256");

@@ -15,6 +15,16 @@ const archive = {
   browser: { appearance: { "mindfs-appearance-mode": "moss", "mindfs-sidebars-swapped": "1" } },
 };
 assert.deepEqual(host(availableConfigCategories(parseConfigArchive(JSON.stringify(archive)))), ["appearance", "providers"]);
+for (const [key, value] of [["mindfs-project-tree-tab", "svn"], ["mindfs-sidebar-footer-hidden", "1"]]) {
+  const valid = structuredClone(archive);
+  valid.browser.appearance[key] = value;
+  parseConfigArchive(JSON.stringify(valid));
+}
+{
+  const invalid = structuredClone(archive);
+  invalid.browser.appearance["mindfs-sidebar-footer-hidden"] = "yes";
+  assert.throws(() => parseConfigArchive(JSON.stringify(invalid)));
+}
 for (const id of ["api_keys", "agent_backups", "custom_agents", "token_station", "projects", "recent"]) {
   assert.equal(CONFIG_CATEGORIES.find(c => c.id === id).defaultSelected, false);
 }

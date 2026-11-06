@@ -29,7 +29,15 @@ export async function protectedJSON<T>(input: RequestInfo | URL, init: RequestIn
     throw new Error("api_not_ready");
   }
   const response = await e2eeService.protectedFetch(input, init);
-  const payload = await e2eeService.parseProtectedJSONResponse<any>(response).catch(() => ({}));
+  let payload: any;
+  try {
+    payload = await e2eeService.parseProtectedJSONResponse<any>(response);
+  } catch (error) {
+    if (response.ok) {
+      throw error;
+    }
+    payload = {};
+  }
   if (!response.ok) {
     throw new ProtectedAPIError(response.status, payload, `request failed: ${response.status}`);
   }

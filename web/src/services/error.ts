@@ -22,6 +22,8 @@ export type ErrorCode =
   | "git.related_file_diff_failed"
   | "git.worktree_switch_failed"
   | "git.worktree_remove_failed"
+  | "svn.related_file_diff_failed"
+  | "svn.diff_failed"
   // Agent errors
   | "agent.unavailable"
   | "agent.timeout"
@@ -208,6 +210,16 @@ class ErrorService {
       "git.worktree_remove_failed": {
         messageKey: "error.git.worktreeRemoveFailed",
         severity: "error",
+        recoverable: true,
+      },
+      "svn.related_file_diff_failed": {
+        messageKey: "error.svn.relatedFileDiffFailed",
+        severity: "warning",
+        recoverable: true,
+      },
+      "svn.diff_failed": {
+        messageKey: "error.svn.diffFailed",
+        severity: "warning",
         recoverable: true,
       },
       "agent.unavailable": {

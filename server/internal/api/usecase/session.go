@@ -963,21 +963,24 @@ type DeleteSessionInput struct {
 	KeepChildren bool
 }
 
-func (s *Service) DeleteSession(ctx context.Context, in DeleteSessionInput) error {
+// DeleteSession removes a session (and, unless KeepChildren is set, its
+// descendant sessions). It returns every deleted session key so callers can
+// notify other connected clients.
+func (s *Service) DeleteSession(ctx context.Context, in DeleteSessionInput) ([]string, error) {
 	if err := s.ensureRegistry(); err != nil {
-		return err
+		return nil, err
 	}
 	root, err := s.Registry.GetRoot(in.RootID)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	manager, err := s.Registry.GetSessionManager(in.RootID)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	keys, err := deleteSessionCascadeKeys(ctx, manager, in.Key)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if in.KeepChildren {
 		keys = []string{strings.TrimSpace(in.Key)}
@@ -990,11 +993,11 @@ func (s *Service) DeleteSession(ctx context.Context, in DeleteSessionInput) erro
 	}); ok {
 		executionKeys, err := cleaner.DeleteSessionTaskGroups(ctx, in.RootID, keys)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		metas, err := manager.ListMetas(ctx)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		existing := map[string]bool{}
 		for _, meta := range metas {
@@ -1015,7 +1018,7 @@ func (s *Service) DeleteSession(ctx context.Context, in DeleteSessionInput) erro
 			}
 			children, err := deleteSessionCascadeKeys(ctx, manager, key)
 			if err != nil {
-				return err
+				return nil, err
 			}
 			for _, child := range children {
 				if !seen[child] {
@@ -1027,22 +1030,22 @@ func (s *Service) DeleteSession(ctx context.Context, in DeleteSessionInput) erro
 	}
 	if in.KeepChildren {
 		if err := manager.DetachChildren(ctx, in.Key); err != nil {
-			return err
+			return nil, err
 		}
 	}
 	for _, key := range keys {
 		cancelActiveSessionTurn(in.RootID, key)
 
 		if err := manager.Delete(ctx, key); err != nil {
-			return err
+			return nil, err
 		}
 		if err := root.RemoveSessionFileMeta(key); err != nil {
-			return err
+			return nil, err
 		}
 		commandexec.CloseSession(in.RootID, key)
 		s.Registry.ReleaseFileWatcher(in.RootID, key)
 	}
-	return nil
+	return keys, nil
 }
 
 func deleteSessionCascadeKeys(ctx context.Context, manager *session.Manager, key string) ([]string, error) {
@@ -2672,6 +2675,13 @@ func (r *claudeSubagentRouter) Handle(ctx context.Context, update agenttypes.Eve
 	if strings.TrimSpace(ref.ParentToolUseID) == "" && r.find(ref) == nil {
 		return false
 	}
+	// A progress/result update alone never identifies a subagent: children are
+	// materialized from message or tool-call streams. Without this guard, a
+	// long-running tool's heartbeat (which keeps parent_tool_use_id) would
+	// create a phantom child session named after the tool.
+	if update.Type == agenttypes.EventTypeToolUpdate && r.find(ref) == nil {
+		return false
+	}
 	child, err := r.ensure(ctx, ref, toolCallFromUpdate(update))
 	if err != nil {
 		log.Printf("[subagent/claude] session.ensure.error root=%s parent=%s ref=%s err=%v", r.in.RootID, r.in.Parent.Key, ref.key(), err)
@@ -3576,21 +3586,42 @@ func (s *Service) AnswerQuestion(ctx context.Context, in AnswerQuestionInput) er
 	if pool == nil {
 		return errors.New("agent pool unavailable")
 	}
-	sess, ok := pool.Get(agentPoolSessionKey(sessionKey, agentName))
-	if !ok {
-		return errors.New("agent session not found")
+	sess, err := resolveAnswerRuntimeSession(ctx, manager, sessionKey, agentName, pool)
+	if err != nil {
+		return err
 	}
 	answer := agenttypes.AskUserAnswer{
 		ToolUseID: strings.TrimSpace(in.ToolUseID),
 		Answers:   in.Answers,
 	}
-	if err := manager.MarkPendingAskUserAnswered(ctx, sessionKey, answer.ToolUseID, answer.Answers, time.Now()); err != nil {
-		return err
-	}
+	// Deliver first: a failed delivery must not leave the pending tool call
+	// marked as answered, otherwise the question can never be retried.
 	if err := sess.AnswerQuestion(ctx, answer); err != nil {
 		return err
 	}
+	if err := manager.MarkPendingAskUserAnswered(ctx, sessionKey, answer.ToolUseID, answer.Answers, time.Now()); err != nil {
+		log.Printf("[session.answer_question] mark.error root=%s session=%s tool=%s err=%v", strings.TrimSpace(in.RootID), sessionKey, answer.ToolUseID, err)
+	}
 	return nil
+}
+
+// resolveAnswerRuntimeSession returns the live agent runtime that owns a
+// question. Synthetic Claude subagent sessions only exist as child records in
+// the session manager; their question waiters live on the parent runtime, so
+// walk up the parent chain until a pooled runtime is found.
+func resolveAnswerRuntimeSession(ctx context.Context, manager *session.Manager, sessionKey, agentName string, pool *agent.Pool) (agenttypes.Session, error) {
+	key := strings.TrimSpace(sessionKey)
+	for depth := 0; key != "" && depth < 16; depth++ {
+		if sess, ok := pool.Get(agentPoolSessionKey(key, agentName)); ok {
+			return sess, nil
+		}
+		current, err := manager.Get(ctx, key, 0)
+		if err != nil {
+			return nil, err
+		}
+		key = strings.TrimSpace(current.ParentSessionKey)
+	}
+	return nil, errors.New("agent session not found")
 }
 
 func currentAssistantLine(responseText string) int {

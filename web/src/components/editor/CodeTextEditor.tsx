@@ -5,6 +5,7 @@ import { useI18n } from "../../i18n";
 import type { FileEditSession, FileEditStore } from "../../services/fileEditing";
 import { codeEditorAttributes, createCodeEditorState, editorContentAttributes, editorLanguage, editorReadOnly } from "./codeEditorState";
 import { codeLanguageForPath } from "./codeEditorLanguage";
+import "../codeHighlight.css";
 
 type Props = {
   store: FileEditStore;

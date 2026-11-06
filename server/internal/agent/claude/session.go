@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"log"
 	"path/filepath"
+	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -216,6 +218,7 @@ type session struct {
 
 	pendingToolMu    sync.Mutex
 	pendingToolCalls map[string]types.ToolCall
+	pendingToolOrder []string
 	taskInfos        map[string]claudeTaskInfo
 
 	questionMu    sync.Mutex
@@ -611,6 +614,14 @@ func (s *session) consumeMessages() {
 			s.handleTodoUpdateMessage(m)
 		case claudeagent.ToolProgressMessage:
 			// Lightweight progress heartbeat for a tool call that is still running.
+			// Claude Code gives each heartbeat a synthetic tool_use_id
+			// ("<tool_use_id>-heartbeat-N") that still points at the original
+			// tool via parent_tool_use_id. Forwarding those would add phantom
+			// tool cards and, through the subagent router, phantom child
+			// sessions for ordinary long-running commands.
+			if isClaudeToolProgressHeartbeat(m) {
+				continue
+			}
 			s.flushAllDeltas()
 			s.emitToolUpdate(m.ToolUseID, m.ToolName, subagentMetaFromToolProgress(m))
 		case claudeagent.CompactBoundaryMessage:
@@ -666,10 +677,25 @@ func (s *session) consumeMessages() {
 }
 
 func (s *session) handlePartialAssistantMessage(rawEvent json.RawMessage, meta subagentMeta) {
-	if contextTokens := contextTokensFromPartialEvent(rawEvent); contextTokens > 0 {
-		s.mu.Lock()
-		s.context.TotalTokens = contextTokens
-		s.mu.Unlock()
+	// Subagent partials describe the child's prompt size, not this session's.
+	if !meta.hasSubagentRef() {
+		if contextTokens := contextTokensFromPartialEvent(rawEvent); contextTokens > 0 {
+			s.mu.Lock()
+			changed := s.context.TotalTokens != contextTokens
+			s.context.TotalTokens = contextTokens
+			contextWindow := s.context
+			s.mu.Unlock()
+			// The model's maximum window is only reported in the end-of-turn
+			// result. Emit used tokens as soon as they are known so clients
+			// can show a token count before a percentage is available.
+			if changed && contextWindow.TotalTokens > 0 {
+				s.emit(types.Event{
+					Type:      types.EventTypeContextUpdate,
+					SessionID: s.SessionID(),
+					Data:      types.ContextUpdate{ContextWindow: contextWindow},
+				})
+			}
+		}
 	}
 	textDelta, thinkingDelta := extractDeltas(rawEvent)
 	if textDelta == "" && thinkingDelta == "" && len(rawEvent) > 0 && !isKnownNonDisplayPartialEvent(rawEvent) {
@@ -1612,6 +1638,21 @@ func subagentMetaFromToolProgress(msg claudeagent.ToolProgressMessage) subagentM
 	return meta
 }
 
+// isClaudeToolProgressHeartbeat reports whether a tool progress event is one of
+// the periodic liveness heartbeats emitted for a still-running tool call. The
+// CLI derives their id from the original tool_use_id, so they must not be
+// re-emitted as standalone tool updates.
+func isClaudeToolProgressHeartbeat(msg claudeagent.ToolProgressMessage) bool {
+	const marker = "-heartbeat-"
+	id := strings.TrimSpace(msg.ToolUseID)
+	index := strings.LastIndex(id, marker)
+	if index <= 0 {
+		return false
+	}
+	_, err := strconv.Atoi(strings.TrimSpace(id[index+len(marker):]))
+	return err == nil
+}
+
 func (m subagentMeta) hasSubagentRef() bool {
 	return strings.TrimSpace(m.ParentToolUseID) != "" || strings.TrimSpace(m.TaskID) != ""
 }
@@ -1784,6 +1825,9 @@ func (s *session) trackPendingToolCall(toolCall types.ToolCall) {
 	if key == "" {
 		key = toolCall.CallID
 	}
+	if _, exists := s.pendingToolCalls[key]; !exists {
+		s.pendingToolOrder = append(s.pendingToolOrder, key)
+	}
 	s.pendingToolCalls[key] = toolCall
 }
 
@@ -1812,7 +1856,7 @@ func (s *session) cancelPendingToolCall(callID, reason string) (types.ToolCall, 
 	if !ok {
 		return types.ToolCall{}, false
 	}
-	delete(s.pendingToolCalls, callID)
+	s.deletePendingToolCallLocked(callID)
 	toolCall.Status = "failed"
 	toolCall.Meta = mergeToolCallMeta(toolCall.Meta, map[string]any{"error": reason, "canceled": true})
 	if len(toolCall.Content) == 0 && strings.TrimSpace(reason) != "" {
@@ -1823,20 +1867,21 @@ func (s *session) cancelPendingToolCall(callID, reason string) (types.ToolCall, 
 
 func (s *session) toolResultUpdate(msg claudeagent.UserMessage) (types.ToolCall, bool) {
 	if msg.ToolUseResult == nil {
-		return types.ToolCall{}, false
+		// Subagent tool results arrive without tool_use_result. The SDK also
+		// drops the tool_result block's tool_use_id, so the only stable link is
+		// parent_tool_use_id: complete the oldest matching subagent call.
+		return s.subagentToolResultUpdate(msg)
 	}
 
-	callID := ""
+	parentToolUseID := ""
 	if msg.ParentToolUseID != nil {
-		callID = strings.TrimSpace(*msg.ParentToolUseID)
+		parentToolUseID = strings.TrimSpace(*msg.ParentToolUseID)
 	}
+	callID := parentToolUseID
 	if callID == "" {
 		callID = extractToolResultCallID(msg.ToolUseResult)
 	}
-	base, ok := s.popPendingToolCall(callID)
-	if !ok && callID == "" {
-		base, ok = s.popOnlyPendingToolCall()
-	}
+	base, ok := s.popPendingToolCallForResult(callID, msg.ToolUseResult)
 	if !ok {
 		return types.ToolCall{}, false
 	}
@@ -1857,6 +1902,43 @@ func (s *session) toolResultUpdate(msg claudeagent.UserMessage) (types.ToolCall,
 		}
 	}
 	return update, true
+}
+
+// subagentToolResultUpdate completes a tool call that belongs to a subagent.
+// Claude reports the parent Task id for those messages while the tool result
+// itself carries no tool_use_result, so neither the call id nor the output is
+// available. Completing the oldest pending call under the parent keeps later
+// top-level results from being attributed to a stale subagent entry.
+func (s *session) subagentToolResultUpdate(msg claudeagent.UserMessage) (types.ToolCall, bool) {
+	if msg.ParentToolUseID == nil || !userMessageHasToolResultBlock(msg) {
+		return types.ToolCall{}, false
+	}
+	parentToolUseID := strings.TrimSpace(*msg.ParentToolUseID)
+	if parentToolUseID == "" {
+		return types.ToolCall{}, false
+	}
+
+	s.pendingToolMu.Lock()
+	defer s.pendingToolMu.Unlock()
+	for _, key := range s.pendingKeysInOrderLocked() {
+		toolCall, ok := s.pendingToolCalls[key]
+		if !ok || stringMeta(toolCall.Meta, "parentToolUseId") != parentToolUseID {
+			continue
+		}
+		s.deletePendingToolCallLocked(key)
+		toolCall.Status = "complete"
+		return toolCall, true
+	}
+	return types.ToolCall{}, false
+}
+
+func userMessageHasToolResultBlock(msg claudeagent.UserMessage) bool {
+	for _, block := range msg.Message.Content {
+		if strings.EqualFold(strings.TrimSpace(block.Type), "tool_result") {
+			return true
+		}
+	}
+	return false
 }
 
 func isTaskListToolCall(toolCall types.ToolCall) bool {
@@ -2092,34 +2174,348 @@ func stringMeta(meta map[string]any, key string) string {
 	}
 }
 
-func (s *session) popPendingToolCall(callID string) (types.ToolCall, bool) {
+// popPendingToolCallForResult removes the pending tool call that a top-level
+// tool result belongs to. Claude Code streams each result as its own user
+// message and, for parallel tool calls, does not expose the tool_use_id to the
+// SDK: parent_tool_use_id is null and only parented messages identify a
+// subagent's Task. Results for parallel calls therefore have to be matched by
+// the shape of tool_use_result (and by file/query when available). Falling back
+// to the oldest matching call keeps the pending set draining; dropping
+// unmatched results would leave stale entries that poison every later result.
+func (s *session) popPendingToolCallForResult(callID string, raw any) (types.ToolCall, bool) {
 	s.pendingToolMu.Lock()
 	defer s.pendingToolMu.Unlock()
 
+	if len(s.pendingToolCalls) == 0 {
+		return types.ToolCall{}, false
+	}
 	callID = strings.TrimSpace(callID)
-	if callID == "" || len(s.pendingToolCalls) == 0 {
+	kind, hasKind := claudeToolResultKind(raw)
+	if callID != "" {
+		if toolCall, ok := s.pendingToolCalls[callID]; ok {
+			// Parented results reference the parent Task, not the tool that
+			// produced them. Never let a child's output complete the Task.
+			if !(toolCall.Kind == types.ToolKindTask && hasKind && kind != types.ToolKindTask) {
+				s.deletePendingToolCallLocked(callID)
+				return toolCall, true
+			}
+		}
+	}
+
+	keys := s.pendingKeysInOrderLocked()
+	if callID != "" {
+		// parent_tool_use_id can point at the parent Task instead of the tool
+		// that produced the result. Restrict matching to that Task's children.
+		scoped := make([]string, 0, len(keys))
+		for _, key := range keys {
+			if stringMeta(s.pendingToolCalls[key].Meta, "parentToolUseId") == callID {
+				scoped = append(scoped, key)
+			}
+		}
+		if len(scoped) > 0 {
+			keys = scoped
+		}
+	}
+
+	if hasKind {
+		candidates := make([]string, 0, len(keys))
+		for _, key := range keys {
+			if s.pendingToolCalls[key].Kind == kind {
+				candidates = append(candidates, key)
+			}
+		}
+		if kind == types.ToolKindTask {
+			if payload, ok := toolResultPayload(raw); ok {
+				candidates = filterPendingTaskCandidates(s.pendingToolCalls, candidates, payload)
+			}
+		}
+		keys = candidates
+	} else {
+		// Plain-string results come from fetch/other tools such as WebFetch
+		// and TaskStop; never let one pop a read, edit, or command call.
+		plausible := make([]string, 0, len(keys))
+		for _, key := range keys {
+			switch s.pendingToolCalls[key].Kind {
+			case types.ToolKindFetch, types.ToolKindOther:
+				plausible = append(plausible, key)
+			}
+		}
+		keys = plausible
+	}
+	if len(keys) == 0 {
+		if len(s.pendingToolCalls) == 1 {
+			for key, toolCall := range s.pendingToolCalls {
+				s.deletePendingToolCallLocked(key)
+				return toolCall, true
+			}
+		}
 		return types.ToolCall{}, false
 	}
-	toolCall, ok := s.pendingToolCalls[callID]
-	if !ok {
-		return types.ToolCall{}, false
+	if len(keys) > 1 {
+		if key, ok := matchPendingToolCallIdentity(s.pendingToolCalls, keys, raw); ok {
+			toolCall := s.pendingToolCalls[key]
+			s.deletePendingToolCallLocked(key)
+			return toolCall, true
+		}
 	}
-	delete(s.pendingToolCalls, callID)
+	key := keys[0]
+	toolCall := s.pendingToolCalls[key]
+	s.deletePendingToolCallLocked(key)
 	return toolCall, true
 }
 
-func (s *session) popOnlyPendingToolCall() (types.ToolCall, bool) {
-	s.pendingToolMu.Lock()
-	defer s.pendingToolMu.Unlock()
+func (s *session) deletePendingToolCallLocked(key string) {
+	delete(s.pendingToolCalls, key)
+	for index, existing := range s.pendingToolOrder {
+		if existing == key {
+			s.pendingToolOrder = append(s.pendingToolOrder[:index], s.pendingToolOrder[index+1:]...)
+			return
+		}
+	}
+}
 
-	if len(s.pendingToolCalls) != 1 {
-		return types.ToolCall{}, false
+// pendingKeysInOrderLocked returns pending calls in tool_use order. Sessions
+// restored or built by tests may hold entries without an order; those are
+// appended deterministically so matching stays stable.
+func (s *session) pendingKeysInOrderLocked() []string {
+	keys := make([]string, 0, len(s.pendingToolCalls))
+	seen := make(map[string]struct{}, len(s.pendingToolOrder))
+	for _, key := range s.pendingToolOrder {
+		if _, ok := s.pendingToolCalls[key]; !ok {
+			continue
+		}
+		keys = append(keys, key)
+		seen[key] = struct{}{}
 	}
-	for callID, toolCall := range s.pendingToolCalls {
-		delete(s.pendingToolCalls, callID)
-		return toolCall, true
+	extra := make([]string, 0)
+	for key := range s.pendingToolCalls {
+		if _, ok := seen[key]; !ok {
+			extra = append(extra, key)
+		}
 	}
-	return types.ToolCall{}, false
+	sort.Strings(extra)
+	return append(keys, extra...)
+}
+
+// claudeToolResultKind infers the ToolKind from the per-tool tool_use_result
+// shape Claude sends with each result.
+func claudeToolResultKind(raw any) (types.ToolKind, bool) {
+	payload, ok := toolResultPayload(raw)
+	if !ok {
+		return "", false
+	}
+	has := func(keys ...string) bool {
+		for _, key := range keys {
+			if _, ok := payload[key]; ok {
+				return true
+			}
+		}
+		return false
+	}
+	switch {
+	case has("stdout", "stderr", "interrupted", "noOutputExpected"):
+		return types.ToolKindExecute, true
+	case has("file"):
+		return types.ToolKindRead, true
+	case has("oldString", "newString", "structuredPatch", "originalFile"):
+		return types.ToolKindEdit, true
+	case has("filePath") && has("content"):
+		return types.ToolKindEdit, true
+	case has("mode", "filenames", "totalMatches", "countIsComplete"):
+		return types.ToolKindSearch, true
+	case has("query") && has("results"):
+		return types.ToolKindWebSearch, true
+	case has("questions") && has("answers"):
+		return types.ToolKindAskUser, true
+	case has("agentId", "agentType", "totalToolUseCount", "task", "tasks", "statusChange", "taskId"):
+		return types.ToolKindTask, true
+	case has("commandName") && has("success"):
+		return types.ToolKindOther, true
+	case has("plan"), has("message"):
+		return types.ToolKindThink, true
+	}
+	return "", false
+}
+
+func toolResultPayload(raw any) (map[string]any, bool) {
+	var payload map[string]any
+	if !decodeToolResult(raw, &payload) || len(payload) == 0 {
+		return nil, false
+	}
+	return payload, true
+}
+
+// matchPendingToolCallIdentity narrows same-kind parallel calls using the
+// identifiers Claude repeats in tool_use_result (file paths, search queries,
+// task tool subtype).
+func matchPendingToolCallIdentity(pending map[string]types.ToolCall, candidates []string, raw any) (string, bool) {
+	payload, ok := toolResultPayload(raw)
+	if !ok {
+		return "", false
+	}
+	if path := toolResultFilePath(payload); path != "" {
+		matches := make([]string, 0, 1)
+		for _, key := range candidates {
+			if sameToolResultPath(stringMeta(pending[key].Meta, "filePath"), path) {
+				matches = append(matches, key)
+			}
+		}
+		if len(matches) == 1 {
+			return matches[0], true
+		}
+		if len(matches) > 1 {
+			return "", false
+		}
+	}
+	if query := strings.TrimSpace(stringField(payload, "query")); query != "" {
+		matches := make([]string, 0, 1)
+		for _, key := range candidates {
+			meta := pending[key].Meta
+			if strings.TrimSpace(stringMeta(meta, "query")) == query || strings.TrimSpace(stringMeta(meta, "pattern")) == query {
+				matches = append(matches, key)
+			}
+		}
+		if len(matches) == 1 {
+			return matches[0], true
+		}
+	}
+	if tool := taskToolForResult(payload); tool != "" {
+		matches := make([]string, 0, 1)
+		taskID := taskResultID(payload)
+		for _, key := range candidates {
+			meta := pending[key].Meta
+			pendingTool := pendingTaskTool(stringMeta(meta, "taskTool"))
+			// The Agent/Task tool has no taskTool marker.
+			if tool == "Agent" {
+				if pendingTool == "" {
+					matches = append(matches, key)
+				}
+				continue
+			}
+			if tool == "TaskCreate" {
+				// TaskCreate and TaskGet share the {task: ...} shape. A
+				// pending TaskGet names its task in the tool input, so it can
+				// only be the sender when the ids agree.
+				if pendingTool != "TaskCreate" && pendingTool != "TaskGet" {
+					continue
+				}
+				if taskID != "" && pendingTool == "TaskGet" && pendingTaskID(meta) != taskID {
+					continue
+				}
+				matches = append(matches, key)
+				continue
+			}
+			if pendingTool == tool {
+				matches = append(matches, key)
+			}
+		}
+		if len(matches) == 1 {
+			return matches[0], true
+		}
+	}
+	return "", false
+}
+
+func toolResultFilePath(payload map[string]any) string {
+	if file, ok := payload["file"].(map[string]any); ok {
+		if path := strings.TrimSpace(stringField(file, "filePath")); path != "" {
+			return path
+		}
+	}
+	return strings.TrimSpace(stringField(payload, "filePath"))
+}
+
+func sameToolResultPath(left, right string) bool {
+	left = filepath.Clean(strings.TrimSpace(left))
+	right = filepath.Clean(strings.TrimSpace(right))
+	if left == "" || right == "" || left == "." || right == "." {
+		return false
+	}
+	if runtime.GOOS == "windows" {
+		return strings.EqualFold(left, right)
+	}
+	return left == right
+}
+
+// filterPendingTaskCandidates keeps the pending calls that can belong to the
+// task tool subtype indicated by the result, so a TaskUpdate result never
+// completes an Agent/Task call (or vice versa).
+func filterPendingTaskCandidates(pending map[string]types.ToolCall, candidates []string, payload map[string]any) []string {
+	tool := taskToolForResult(payload)
+	if tool == "" {
+		return candidates
+	}
+	out := make([]string, 0, len(candidates))
+	for _, key := range candidates {
+		pendingTool := pendingTaskTool(stringMeta(pending[key].Meta, "taskTool"))
+		switch tool {
+		case "Agent":
+			if pendingTool == "" {
+				out = append(out, key)
+			}
+		case "TaskCreate":
+			// TaskCreate and TaskGet share the {task: ...} result shape.
+			if pendingTool == "TaskCreate" || pendingTool == "TaskGet" {
+				out = append(out, key)
+			}
+		default:
+			if pendingTool == tool {
+				out = append(out, key)
+			}
+		}
+	}
+	if len(out) == 0 {
+		return candidates
+	}
+	return out
+}
+
+func taskToolForResult(payload map[string]any) string {
+	has := func(key string) bool {
+		_, ok := payload[key]
+		return ok
+	}
+	switch {
+	case has("agentId") || has("agentType") || has("totalToolUseCount"):
+		return "Agent"
+	case has("statusChange") || has("taskId"):
+		return "TaskUpdate"
+	case has("tasks"):
+		return "TaskList"
+	case has("task"):
+		return "TaskCreate"
+	}
+	return ""
+}
+
+func pendingTaskTool(tool string) string {
+	if strings.TrimSpace(tool) == "" {
+		return ""
+	}
+	return canonicalTaskListToolName(tool)
+}
+
+func taskResultID(payload map[string]any) string {
+	if task, ok := payload["task"].(map[string]any); ok {
+		if id := strings.TrimSpace(stringField(task, "id")); id != "" {
+			return id
+		}
+	}
+	return strings.TrimSpace(stringField(payload, "taskId"))
+}
+
+func pendingTaskID(meta map[string]any) string {
+	raw := stringMeta(meta, "input")
+	if raw == "" {
+		return ""
+	}
+	var input struct {
+		TaskID string `json:"taskId"`
+	}
+	if json.Unmarshal([]byte(raw), &input) != nil {
+		return ""
+	}
+	return strings.TrimSpace(input.TaskID)
 }
 
 func summarizeToolResult(kind types.ToolKind, raw any) string {
@@ -2128,9 +2524,122 @@ func summarizeToolResult(kind types.ToolKind, raw any) string {
 		return summarizeExecuteToolResult(raw)
 	case types.ToolKindEdit:
 		return summarizeEditToolResult(raw)
+	case types.ToolKindRead:
+		if text := summarizeReadToolResult(raw); text != "" {
+			return text
+		}
+		return summarizeGenericToolResult(raw)
+	case types.ToolKindSearch:
+		if text := summarizeSearchToolResult(raw); text != "" {
+			return text
+		}
+		return summarizeGenericToolResult(raw)
+	case types.ToolKindWebSearch:
+		if text := summarizeWebSearchToolResult(raw); text != "" {
+			return text
+		}
+		return summarizeGenericToolResult(raw)
+	case types.ToolKindFetch, types.ToolKindOther:
+		return summarizeGenericToolResult(raw)
 	default:
 		return ""
 	}
+}
+
+// Claude surfaces tool output only through tool_use_result structures: the SDK
+// drops the readable tool_result text block. Read/Glob/Grep/WebSearch results
+// therefore need to be pulled out of their per-tool shapes explicitly.
+func summarizeReadToolResult(raw any) string {
+	var payload struct {
+		File struct {
+			Content string `json:"content"`
+		} `json:"file"`
+	}
+	if !decodeToolResult(raw, &payload) {
+		return ""
+	}
+	if strings.TrimSpace(payload.File.Content) == "" {
+		return ""
+	}
+	return payload.File.Content
+}
+
+func summarizeSearchToolResult(raw any) string {
+	var payload struct {
+		Mode      string   `json:"mode"`
+		Filenames []string `json:"filenames"`
+		Content   string   `json:"content"`
+	}
+	if !decodeToolResult(raw, &payload) {
+		return ""
+	}
+	if strings.TrimSpace(payload.Content) != "" {
+		return payload.Content
+	}
+	filenames := make([]string, 0, len(payload.Filenames))
+	for _, name := range payload.Filenames {
+		if name = strings.TrimSpace(name); name != "" {
+			filenames = append(filenames, name)
+		}
+	}
+	if len(filenames) > 0 {
+		return strings.Join(filenames, "\n")
+	}
+	if payload.Mode == "files_with_matches" {
+		return "No matching files."
+	}
+	return ""
+}
+
+func summarizeWebSearchToolResult(raw any) string {
+	var payload struct {
+		Results []any `json:"results"`
+	}
+	if !decodeToolResult(raw, &payload) {
+		return ""
+	}
+	// Claude mixes link objects and a trailing plain-text summary in the same
+	// results array, so each entry has to be handled by its actual type.
+	links := make([]string, 0, len(payload.Results))
+	seen := make(map[string]struct{}, len(payload.Results))
+	summary := ""
+	for _, entry := range payload.Results {
+		switch value := entry.(type) {
+		case string:
+			if summary == "" {
+				summary = strings.TrimSpace(value)
+			}
+		case map[string]any:
+			content, _ := value["content"].([]any)
+			for _, rawLink := range content {
+				link, _ := rawLink.(map[string]any)
+				if link == nil {
+					continue
+				}
+				url := strings.TrimSpace(stringField(link, "url"))
+				if url == "" {
+					continue
+				}
+				if _, ok := seen[url]; ok {
+					continue
+				}
+				seen[url] = struct{}{}
+				title := strings.TrimSpace(stringField(link, "title"))
+				if title == "" {
+					title = url
+				}
+				links = append(links, fmt.Sprintf("- [%s](%s)", title, url))
+			}
+		}
+	}
+	parts := make([]string, 0, 2)
+	if summary != "" {
+		parts = append(parts, summary)
+	}
+	if len(links) > 0 {
+		parts = append(parts, strings.Join(links, "\n"))
+	}
+	return strings.Join(parts, "\n\n")
 }
 
 func summarizeExecuteToolResult(raw any) string {
@@ -2501,18 +3010,31 @@ func contextTokensFromPartialEvent(raw json.RawMessage) int {
 	if len(raw) == 0 {
 		return 0
 	}
-	var event struct {
-		Type  string `json:"type"`
-		Usage struct {
-			InputTokens              int `json:"input_tokens"`
-			CacheReadInputTokens     int `json:"cache_read_input_tokens"`
-			CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
-		} `json:"usage"`
+	type usage struct {
+		InputTokens              int `json:"input_tokens"`
+		CacheReadInputTokens     int `json:"cache_read_input_tokens"`
+		CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
 	}
-	if err := json.Unmarshal(raw, &event); err != nil || strings.TrimSpace(event.Type) != "message_delta" {
+	var event struct {
+		Type    string `json:"type"`
+		Usage   usage  `json:"usage"`
+		Message struct {
+			Usage usage `json:"usage"`
+		} `json:"message"`
+	}
+	if err := json.Unmarshal(raw, &event); err != nil {
 		return 0
 	}
-	return event.Usage.InputTokens + event.Usage.CacheReadInputTokens + event.Usage.CacheCreationInputTokens
+	var current usage
+	switch strings.TrimSpace(event.Type) {
+	case "message_start":
+		current = event.Message.Usage
+	case "message_delta":
+		current = event.Usage
+	default:
+		return 0
+	}
+	return current.InputTokens + current.CacheReadInputTokens + current.CacheCreationInputTokens
 }
 
 func extractDeltas(raw json.RawMessage) (string, string) {

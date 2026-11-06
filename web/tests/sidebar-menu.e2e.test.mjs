@@ -1,19 +1,15 @@
 import assert from "node:assert/strict";
-import { access } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { after, before, test } from "node:test";
 import { chromium } from "playwright-core";
 import { createServer } from "vite";
+import { findBrowserExecutable, getFreePort } from "./browserExecutable.mjs";
 
 let server, browser;
 before(async () => {
-  const candidates = process.platform === "darwin"
-    ? ["/Applications/Google Chrome.app/Contents/MacOS/Google Chrome", "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge"]
-    : ["/opt/google/chrome/chrome", "/usr/bin/chromium", "/usr/bin/google-chrome"];
-  let executablePath;
-  for (const path of candidates) { try { await access(path); executablePath = path; break; } catch {} }
+  const executablePath = await findBrowserExecutable();
   assert.ok(executablePath, "Requires an installed Chromium browser");
-  server = await createServer({ root: fileURLToPath(new URL("../", import.meta.url)), server: { host: "127.0.0.1", port: 0 } });
+  server = await createServer({ root: fileURLToPath(new URL("../", import.meta.url)), server: { host: "127.0.0.1", port: await getFreePort() } });
   await server.listen();
   browser = await chromium.launch({ executablePath, headless: true });
 });
@@ -51,7 +47,7 @@ for (const mobile of [false, true]) test(`sidebar categories preserve settings a
     assert.equal(await menu().getByRole("button", { expanded: true }).count(), 0);
 
     await openCategory("项目与文件");
-    assert.deepEqual(await firstLabels(group("项目与文件")), ["全局排序", "显示隐藏文件", "双栏 diff 视图", "新项目数据位置"]);
+    assert.deepEqual(await firstLabels(group("项目与文件")), ["全局排序", "显示隐藏文件", "隐藏侧栏底部", "双栏 diff 视图", "新项目数据位置"]);
     const hidden = group("项目与文件").getByRole("button", { name: "显示隐藏文件" });
     await hidden.click();
     assert.equal(await hidden.getAttribute("aria-pressed"), "true");

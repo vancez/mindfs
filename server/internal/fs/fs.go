@@ -781,6 +781,12 @@ func TryDecodeText(buf []byte, ext string) (string, string, bool) {
 	if !isTextLikeExt(ext) {
 		return "", "", false
 	}
+	// BOM-less UTF-16 ASCII content is also valid UTF-8 (it contains NUL
+	// bytes). Leave it to the UTF-16 heuristic below instead of returning
+	// mojibake/NUL-laden "text".
+	if utf8.Valid(buf) && !bytes.Contains(buf, []byte{0}) {
+		return string(buf), "utf-8", true
+	}
 
 	if decoded, ok := decodeUTF16(buf); ok {
 		return decoded, "utf-16", true

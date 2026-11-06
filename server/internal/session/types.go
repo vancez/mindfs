@@ -63,7 +63,13 @@ type ExchangeAux struct {
 
 func CompactExchangeAux(aux ExchangeAux) (ExchangeAux, bool) {
 	if aux.ToolCall == nil {
-		if aux.Todo != nil || aux.Plan != nil || aux.Compact != nil {
+		// Thinking is persisted as its own aux entry. Dropping it here makes
+		// completed turns lose their reasoning as soon as the client syncs the
+		// session from the server, even though the entry is on disk.
+		if strings.TrimSpace(aux.Thought) != "" ||
+			aux.Todo != nil ||
+			aux.Plan != nil ||
+			aux.Compact != nil {
 			return aux, true
 		}
 		return ExchangeAux{}, false

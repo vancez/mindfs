@@ -233,6 +233,15 @@ export type StreamEvent = { event_cursor?: string } & (
   | { type: "compact_notice"; data: CompactNotice }
   | { type: "recovery"; data: { message: string } }
   | {
+      type: "context_update";
+      data?: {
+        contextWindow?: {
+          totalTokens: number;
+          modelContextWindow: number;
+        };
+      };
+    }
+  | {
       type: "message_done";
       data?: {
         contextWindow?: {
@@ -299,6 +308,11 @@ type PendingMessage = {
   message: Record<string, unknown>;
 };
 
+type PendingAnswerQuestionRequest = {
+  resolve: (ok: boolean) => void;
+  timer: number;
+};
+
 class SessionService {
   private ws: WebSocket | null = null;
   private handlers = new Map<string, Set<SessionEventHandler>>();
@@ -306,6 +320,7 @@ class SessionService {
   private activeStreams = new Set<string>();
   private eventCursors = new Map<string, string>();
   private pendingMessages = new Map<string, PendingMessage>();
+  private answerQuestionRequests = new Map<string, PendingAnswerQuestionRequest>();
   private listeners = new Set<(event: SessionServiceEvent) => void>();
   private reconnectTimer: number | null = null;
   private connectTimeoutTimer: number | null = null;
@@ -315,14 +330,24 @@ class SessionService {
   private consecutiveProbeFailures = 0;
   private connectingStartedAt = 0;
   private openingSocket = false;
-  private reconnectDelayMs = 1000;
-  private fastReconnectUntil = 0;
+  private openingStartedAt = 0;
+  private openAttempt = 0;
+  private reconnectFailures = 0;
+  private nextReconnectAt = 0;
+  private socketOpenedAt = 0;
+  private wsInboundSeq = 0;
+  private wsOutboundSeq = 0;
+  private wsReceiveChain: Promise<void> = Promise.resolve();
+  private wsSendChain: Promise<unknown> = Promise.resolve();
   private rootId: string | null = null;
   private hasConnected = false;
+  private lastReportedFocus: boolean | null = null;
+  private focusReportQueue: Promise<void> = Promise.resolve();
   private readonly clientId = this.generateClientId();
   private readonly maxReconnectDelayMs = 30000;
   private readonly fastReconnectDelayMs = 1000;
-  private readonly fastReconnectWindowMs = 10000;
+  private readonly maxReconnectFailures = 5;
+  private readonly stableConnectionMs = 10000;
   private readonly connectTimeoutMs = 15000;
   private readonly probeTimeoutMs = 8000;
   private readonly lifecycleCheckDelayMs = 750;
@@ -334,8 +359,15 @@ class SessionService {
     e2eeService.setClientId(this.clientId);
     if (typeof window !== "undefined") {
       window.addEventListener("online", () => this.scheduleLifecycleCheck());
-      window.addEventListener("pageshow", () => this.scheduleLifecycleCheck());
-      window.addEventListener("focus", () => this.scheduleLifecycleCheck());
+      window.addEventListener("pageshow", () => {
+        this.scheduleLifecycleCheck();
+        this.reportFocusState();
+      });
+      window.addEventListener("focus", () => {
+        this.scheduleLifecycleCheck();
+        this.reportFocusState();
+      });
+      window.addEventListener("blur", () => this.reportFocusState());
       window.setInterval(() => this.ensureReconnectLoop(), this.reconnectWatchdogMs);
     }
     if (typeof document !== "undefined") {
@@ -343,12 +375,49 @@ class SessionService {
         if (document.visibilityState === "visible") {
           this.scheduleLifecycleCheck();
         }
+        this.reportFocusState();
       });
     }
   }
 
   private generateClientId(): string {
     return `web-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+  }
+
+  private isDocumentFocused(): boolean {
+    if (typeof document === "undefined") {
+      return false;
+    }
+    return document.visibilityState === "visible" && document.hasFocus();
+  }
+
+  private reportFocusState(
+    focused = this.isDocumentFocused(),
+    force = false,
+  ): void {
+    if (!force && focused === this.lastReportedFocus) {
+      return;
+    }
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+      this.lastReportedFocus = null;
+      return;
+    }
+    this.lastReportedFocus = focused;
+    // Serialize reports so a slow E2EE encode cannot reorder focus/blur.
+    this.focusReportQueue = this.focusReportQueue
+      .then(async () => {
+        const sent = await this.sendWSMessage({
+          type: "client.focus",
+          payload: { focused },
+        });
+        if (!sent) {
+          this.lastReportedFocus = null;
+        }
+      })
+      .catch((err) => {
+        this.lastReportedFocus = null;
+        console.error("[Session] Failed to report focus state:", err);
+      });
   }
 
   createRequestId(prefix = "msg"): string {
@@ -371,9 +440,17 @@ class SessionService {
   }
 
   connect(rootId: string) {
+    const rootChanged = this.rootId !== rootId;
     this.rootId = rootId;
     if (this.ws?.readyState === WebSocket.OPEN) {
-      this.emit({ type: this.hasConnected ? "ws.reconnected" : "ws.connected" });
+      // connect() is also called when the selected root changes. A redundant
+      // call for the same root must not look like a transport reconnect:
+      // every ws.reconnected event triggers a full session/root refresh.
+      if (rootChanged || !this.hasConnected) {
+        this.emit({
+          type: this.hasConnected ? "ws.reconnected" : "ws.connected",
+        });
+      }
       this.hasConnected = true;
       return;
     }
@@ -382,7 +459,7 @@ class SessionService {
         this.connectingStartedAt > 0 &&
         Date.now() - this.connectingStartedAt > this.connectTimeoutMs
       ) {
-        this.reconnectNow();
+        this.failConnectingAttempt("connect_timeout");
         return;
       }
       this.emit({ type: this.hasConnected ? "ws.reconnecting" : "ws.connecting" });
@@ -390,10 +467,24 @@ class SessionService {
     }
 
     this.clearReconnectTimer();
+    this.nextReconnectAt = 0;
     this.closeSocket();
     this.emit({ type: this.hasConnected ? "ws.reconnecting" : "ws.connecting" });
 
     void this.openSocket();
+  }
+
+  private failConnectingAttempt(reason: string) {
+    this.reconnectFailures = Math.min(
+      this.reconnectFailures + 1,
+      this.maxReconnectFailures,
+    );
+    this.emit({
+      type: "ws.closed",
+      payload: { code: 0, reason, was_clean: false },
+    });
+    this.closeSocket();
+    this.scheduleReconnect();
   }
 
   private async openSocket() {
@@ -401,35 +492,59 @@ class SessionService {
       return;
     }
     this.openingSocket = true;
+    this.openingStartedAt = Date.now();
+    const attempt = ++this.openAttempt;
     let target = "";
     try {
       target = await this.buildWSUrl();
     } catch (err) {
+      if (attempt !== this.openAttempt) {
+        return;
+      }
       this.openingSocket = false;
+      this.openingStartedAt = 0;
       console.error("[Session] Failed to prepare WebSocket proof:", err);
+      this.reconnectFailures = Math.min(
+        this.reconnectFailures + 1,
+        this.maxReconnectFailures,
+      );
       this.emit({ type: "ws.closed", payload: { code: 0, reason: "e2ee_proof_failed", was_clean: false } });
       this.scheduleReconnect();
       return;
     }
-    if (!this.rootId || this.ws) {
-      this.openingSocket = false;
+    if (attempt !== this.openAttempt) {
+      // A timeout/watchdog invalidated this attempt while proof preparation
+      // was in flight. Do not open a socket outside the backoff schedule.
       return;
     }
+    if (!this.rootId || this.ws) {
+      this.openingSocket = false;
+      this.openingStartedAt = 0;
+      return;
+    }
+    this.wsInboundSeq = 0;
+    this.wsOutboundSeq = 0;
+    this.wsReceiveChain = Promise.resolve();
+    this.wsSendChain = Promise.resolve();
     const ws = new WebSocket(target);
     this.openingSocket = false;
+    this.openingStartedAt = 0;
+    this.socketOpenedAt = 0;
     this.ws = ws;
     this.connectingStartedAt = Date.now();
     this.connectTimeoutTimer = window.setTimeout(() => {
       if (this.ws !== ws || ws.readyState !== WebSocket.CONNECTING) return;
-      console.warn("[Session] WebSocket connect timed out, reconnecting");
-      this.reconnectNow();
+      console.warn("[Session] WebSocket connect timed out, backing off");
+      this.failConnectingAttempt("connect_timeout");
     }, this.connectTimeoutMs);
 
     ws.onopen = () => {
       if (this.ws !== ws) return;
       this.clearConnectTimeout();
       this.clearProbe();
-      this.reconnectDelayMs = 1000;
+      this.clearReconnectTimer();
+      this.nextReconnectAt = 0;
+      this.socketOpenedAt = Date.now();
       this.consecutiveProbeFailures = 0;
       if (this.hasConnected) {
         this.emit({ type: "ws.reconnected" });
@@ -443,29 +558,64 @@ class SessionService {
         });
       }
       this.resendPendingMessages();
+      this.reportFocusState(this.isDocumentFocused(), true);
     };
 
     ws.onmessage = (event) => {
       if (this.ws !== ws) return;
       this.consecutiveProbeFailures = 0;
       this.clearProbe();
-      void (async () => {
-        try {
-          const msg = await this.parseWSMessage(event.data);
-          if (!msg) {
+      this.wsReceiveChain = this.wsReceiveChain
+        .then(async () => {
+          if (this.ws !== ws) {
             return;
           }
-          this.handleMessage(msg);
-        } catch (err) {
-          console.error("[Session] Failed to parse message:", err);
-        }
-      })();
+          const sequence = this.wsInboundSeq;
+          let msg: any | null = null;
+          try {
+            msg = await this.parseWSMessage(event.data, sequence);
+          } catch (err) {
+            console.error("[Session] Failed to parse message:", err);
+            if (this.ws === ws && e2eeService.isRequired()) {
+              ws.close(4001, "e2ee_frame_invalid");
+            }
+            return;
+          }
+          if (msg) {
+            try {
+              this.handleMessage(msg);
+            } catch (err) {
+              console.error("[Session] Failed to handle message:", err);
+            }
+          }
+        })
+        .catch((err) => {
+          console.error("[Session] Failed to process message:", err);
+        });
     };
 
     ws.onclose = (event) => {
       if (this.ws !== ws) return;
       this.clearConnectTimeout();
+      this.clearProbe();
       this.ws = null;
+      for (const requestId of Array.from(this.answerQuestionRequests.keys())) {
+        this.resolveAnswerQuestionRequest(requestId, false);
+      }
+      const openedAt = this.socketOpenedAt;
+      this.socketOpenedAt = 0;
+      // Only reset the backoff for connections that stayed up long enough to
+      // be considered healthy. A server that accepts and immediately closes
+      // (or a flapping proxy) must still back off instead of retrying at 1s
+      // forever.
+      if (openedAt > 0 && Date.now() - openedAt >= this.stableConnectionMs) {
+        this.reconnectFailures = 0;
+      } else {
+        this.reconnectFailures = Math.min(
+          this.reconnectFailures + 1,
+          this.maxReconnectFailures,
+        );
+      }
       this.emit({
         type: "ws.closed",
         payload: {
@@ -474,7 +624,6 @@ class SessionService {
           was_clean: event.wasClean,
         },
       });
-      this.fastReconnectUntil = Date.now() + this.fastReconnectWindowMs;
       this.scheduleReconnect();
     };
 
@@ -491,6 +640,10 @@ class SessionService {
     this.clearProbe();
     this.clearLifecycleCheck();
     this.consecutiveProbeFailures = 0;
+    this.reconnectFailures = 0;
+    this.nextReconnectAt = 0;
+    this.openingStartedAt = 0;
+    this.socketOpenedAt = 0;
     this.closeSocket();
     this.contextCache.clear();
   }
@@ -537,7 +690,16 @@ class SessionService {
   private closeSocket() {
     this.clearConnectTimeout();
     this.clearProbe();
+    this.openAttempt += 1;
     this.openingSocket = false;
+    this.openingStartedAt = 0;
+    const openedAt = this.socketOpenedAt;
+    this.socketOpenedAt = 0;
+    // onclose is bypassed when a probe or watchdog closes the socket. Still
+    // clear the backoff if the connection had been healthy for a while.
+    if (openedAt > 0 && Date.now() - openedAt >= this.stableConnectionMs) {
+      this.reconnectFailures = 0;
+    }
     if (this.ws) {
       const ws = this.ws;
       this.ws = null;
@@ -552,6 +714,15 @@ class SessionService {
   private ensureConnection() {
     if (!this.rootId) return;
     if (!this.ws || this.ws.readyState >= WebSocket.CLOSING) {
+      if (this.reconnectTimer) {
+        return;
+      }
+      // Lifecycle events (focus/online/pageshow) must not bypass an active
+      // backoff window; they only make sure a scheduled retry exists.
+      if (this.nextReconnectAt > Date.now()) {
+        this.scheduleReconnect();
+        return;
+      }
       this.reconnectNow();
       return;
     }
@@ -560,7 +731,7 @@ class SessionService {
         this.connectingStartedAt > 0 &&
         Date.now() - this.connectingStartedAt > this.connectTimeoutMs
       ) {
-        this.reconnectNow();
+        this.failConnectingAttempt("connect_timeout");
       }
       return;
     }
@@ -570,7 +741,21 @@ class SessionService {
   private ensureReconnectLoop() {
     if (!this.rootId) return;
     if (!this.ws || this.ws.readyState >= WebSocket.CLOSING) {
-      this.reconnectNow();
+      // This runs every few seconds. Let the scheduled reconnect (with its
+      // backoff delay) do the work instead of forcing an immediate retry and
+      // resetting the backoff on every tick.
+      if (this.openingSocket) {
+        if (
+          this.openingStartedAt > 0 &&
+          Date.now() - this.openingStartedAt > this.connectTimeoutMs
+        ) {
+          this.failConnectingAttempt("connect_timeout");
+        }
+        return;
+      }
+      if (!this.reconnectTimer) {
+        this.scheduleReconnect();
+      }
       return;
     }
     if (
@@ -578,7 +763,7 @@ class SessionService {
       this.connectingStartedAt > 0 &&
       Date.now() - this.connectingStartedAt > this.connectTimeoutMs
     ) {
-      this.reconnectNow();
+      this.failConnectingAttempt("connect_timeout");
     }
   }
 
@@ -588,8 +773,6 @@ class SessionService {
     this.clearReconnectTimer();
     this.clearProbe();
     this.closeSocket();
-    this.reconnectDelayMs = 1000;
-    this.fastReconnectUntil = Date.now() + this.fastReconnectWindowMs;
     this.connect(rootId);
   }
 
@@ -662,18 +845,19 @@ class SessionService {
   private scheduleReconnect() {
     if (!this.rootId) return;
     if (this.reconnectTimer) return;
-    const isFastReconnect = Date.now() < this.fastReconnectUntil;
-    const delay = isFastReconnect
-      ? this.fastReconnectDelayMs
-      : this.reconnectDelayMs;
-    if (!isFastReconnect) {
-      this.reconnectDelayMs = Math.min(
-        this.reconnectDelayMs * 2,
-        this.maxReconnectDelayMs,
-      );
-    }
+    const exponent = Math.min(this.reconnectFailures, this.maxReconnectFailures);
+    const backoffDelay = Math.min(
+      this.fastReconnectDelayMs * 2 ** exponent,
+      this.maxReconnectDelayMs,
+    );
+    // Preserve a previously scheduled deadline if a lifecycle event asks for
+    // a retry while one is already due later.
+    const remaining = this.nextReconnectAt - Date.now();
+    const delay = remaining > 0 ? remaining : backoffDelay;
+    this.nextReconnectAt = Date.now() + delay;
     this.reconnectTimer = window.setTimeout(() => {
       this.reconnectTimer = null;
+      this.nextReconnectAt = 0;
       if (this.rootId) {
         this.connect(this.rootId);
       }
@@ -693,6 +877,16 @@ class SessionService {
       return;
     }
     const sessionKey = payload.session_key as string;
+    if (type === "session.answer_question.accepted") {
+      const requestId =
+        typeof payload.request_id === "string"
+          ? payload.request_id
+          : typeof msg.id === "string"
+            ? msg.id
+            : "";
+      this.resolveAnswerQuestionRequest(requestId, true);
+      return;
+    }
     if (type === "session.accepted") {
       const requestId =
         typeof payload.request_id === "string"
@@ -704,6 +898,7 @@ class SessionService {
         this.pendingMessages.delete(requestId);
       }
     } else if (type === "session.error" && typeof msg.id === "string") {
+      this.resolveAnswerQuestionRequest(msg.id, false);
       this.pendingMessages.delete(msg.id);
       payload.request_id = msg.id;
     }
@@ -766,6 +961,12 @@ class SessionService {
       this.activeStreams.delete(sessionKey);
       this.clearEventCursor(String(payload.root_id || ""), sessionKey);
     }
+    if (type === "session.done") {
+      // Stream events only queue while no viewer is subscribed. Once the turn
+      // is done they must not be replayed to the next subscriber as if the
+      // session were still generating.
+      this.pendingStreams.delete(sessionKey);
+    }
     this.emit({ type, sessionKey, payload: nextPayload });
 
     if (!sessionKey) return;
@@ -816,7 +1017,7 @@ class SessionService {
     }
   }
 
-  private async parseWSMessage(raw: unknown): Promise<any | null> {
+  private async parseWSMessage(raw: unknown, sequence: number): Promise<any | null> {
     if (typeof raw !== "string") {
       return null;
     }
@@ -824,22 +1025,39 @@ class SessionService {
     if (!e2eeService.isRequired() || parsed?.type === "e2ee.error") {
       return parsed;
     }
-    return e2eeService.decodeWSMessage<any>(raw);
+    const message = await e2eeService.decodeWSMessage<any>(raw, sequence);
+    this.wsInboundSeq += 1;
+    return message;
   }
 
-  private async sendWSMessage(
+  private sendWSMessage(
     message: Record<string, unknown>,
   ): Promise<boolean> {
-    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
-      return false;
+    const ws = this.ws;
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      return Promise.resolve(false);
     }
-    let serialized = JSON.stringify(message);
-    if (e2eeService.isRequired()) {
+    const send = async (): Promise<boolean> => {
+      if (this.ws !== ws || ws.readyState !== WebSocket.OPEN) {
+        return false;
+      }
+      if (!e2eeService.isRequired()) {
+        ws.send(JSON.stringify(message));
+        return true;
+      }
       await e2eeService.ensureSession();
-      serialized = await e2eeService.encodeWSMessage(message);
-    }
-    this.ws.send(serialized);
-    return true;
+      const sequence = this.wsOutboundSeq;
+      const serialized = await e2eeService.encodeWSMessage(message, sequence);
+      if (this.ws !== ws || ws.readyState !== WebSocket.OPEN) {
+        return false;
+      }
+      ws.send(serialized);
+      this.wsOutboundSeq += 1;
+      return true;
+    };
+    const next = this.wsSendChain.then(send, send);
+    this.wsSendChain = next.then(() => undefined, () => undefined);
+    return next;
   }
 
   subscribeEvents(listener: (event: SessionServiceEvent) => void) {
@@ -871,7 +1089,7 @@ class SessionService {
       this.activeStreams.delete(sessionKey);
       return;
     }
-    if (event.type !== "message_done") {
+    if (event.type !== "message_done" && event.type !== "context_update") {
       this.activeStreams.add(sessionKey);
     }
   }
@@ -1129,8 +1347,9 @@ class SessionService {
       return false;
     }
 
+    const requestId = this.createRequestId("answer");
     const msg = {
-      id: this.createRequestId("answer"),
+      id: requestId,
       type: "session.answer_question",
       payload: {
         root_id: rootId,
@@ -1140,8 +1359,40 @@ class SessionService {
         answers,
       },
     };
+    // Wait for the server acknowledgement so a rejected answer keeps the
+    // question editable instead of closing it and losing the answer.
+    const acknowledged = new Promise<boolean>((resolve) => {
+      const timer = window.setTimeout(() => {
+        this.answerQuestionRequests.delete(requestId);
+        resolve(false);
+      }, 15000);
+      this.answerQuestionRequests.set(requestId, { resolve, timer });
+    });
+    let sent = false;
+    try {
+      sent = await this.sendWSMessage(msg);
+    } catch (err) {
+      this.resolveAnswerQuestionRequest(requestId, false);
+      throw err;
+    }
+    if (!sent) {
+      this.resolveAnswerQuestionRequest(requestId, false);
+      return false;
+    }
+    return acknowledged;
+  }
 
-    return this.sendWSMessage(msg);
+  private resolveAnswerQuestionRequest(requestId: string, ok: boolean) {
+    if (!requestId) {
+      return;
+    }
+    const pending = this.answerQuestionRequests.get(requestId);
+    if (!pending) {
+      return;
+    }
+    this.answerQuestionRequests.delete(requestId);
+    window.clearTimeout(pending.timer);
+    pending.resolve(ok);
   }
 
   async markSessionReady(rootId: string, sessionKey: string): Promise<boolean> {
@@ -1643,7 +1894,9 @@ type CachedSessionListRecord<T> = {
 const SESSION_CACHE_DB = "mindfs-session-cache";
 const SESSION_CACHE_STORE = "sessions";
 const SESSION_LIST_CACHE_STORE = "session-lists";
-const SESSION_CACHE_VERSION = 3;
+// v4 drops cached sessions once so they are re-fetched with persisted
+// thinking aux (the server used to filter thought-only aux from responses).
+const SESSION_CACHE_VERSION = 4;
 const MULTI_ROOT_SESSION_LIST_CACHE_KEY = "multi-root";
 let sessionDBPromise: Promise<IDBDatabase> | null = null;
 
@@ -1668,7 +1921,7 @@ function openSessionDB(): Promise<IDBDatabase> {
     request.onupgradeneeded = (event) => {
       const db = request.result;
       if (
-        (event as IDBVersionChangeEvent).oldVersion < 2 &&
+        (event as IDBVersionChangeEvent).oldVersion < 4 &&
         db.objectStoreNames.contains(SESSION_CACHE_STORE)
       ) {
         db.deleteObjectStore(SESSION_CACHE_STORE);

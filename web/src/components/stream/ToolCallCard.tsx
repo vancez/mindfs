@@ -1,6 +1,7 @@
 import React, { memo, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { sessionService, type ToolCall, type ToolCallContentItem, type ToolCallLocation } from "../../services/session";
 import { MarkdownViewer } from "../MarkdownViewer";
+import { languageForPath } from "../codeHighlight";
 import { useI18n } from "../../i18n";
 
 type ToolCallCardProps = {
@@ -19,6 +20,7 @@ type ToolCallCardProps = {
   viewCache?: ToolCallViewCache;
   viewCacheKey?: string;
   getFallbackResult?: (toolCall: Partial<ToolCall>) => string;
+  onExpand?: () => void;
 };
 
 export type ToolCallViewCache = {
@@ -462,6 +464,7 @@ export const ToolCallCard = memo(function ToolCallCard({
   viewCache,
   viewCacheKey,
   getFallbackResult,
+  onExpand,
 }: ToolCallCardProps) {
   const { t } = useI18n();
   const expansionKey = viewCacheKey || _callId;
@@ -538,7 +541,7 @@ export const ToolCallCard = memo(function ToolCallCard({
   const normalizedStatus = (effectiveStatus || "").toLowerCase();
   const detailSections = useMemo(() => {
     if (!expanded) return [];
-    const sections = buildDetailSections(effectiveContent, effectiveLocations, rootPath);
+    const sections = buildDetailSections(effectiveContent, effectiveLocations, rootPath, normalizedKind);
     if (sections.length > 0 || !result || !isDiffLikeText(result)) {
       return sections;
     }
@@ -550,12 +553,15 @@ export const ToolCallCard = memo(function ToolCallCard({
         markdown: `~~~diff\n${result.trim()}\n~~~`,
       },
     ];
-  }, [expanded, effectiveContent, effectiveLocations, result, rootPath]);
+  }, [expanded, effectiveContent, effectiveLocations, result, rootPath, normalizedKind]);
+  // Command output may contain a unified diff (e.g. `git diff`), but it is
+  // rendered as terminal output rather than a file-change section. Keep those
+  // cards on the normal background so highlighting stays consistent.
   const isFileChange =
     normalizedKind === "edit" ||
     normalizedKind === "delete" ||
     normalizedKind === "move" ||
-    detailSections.some((section) => section.type === "diff");
+    (!isExecute && detailSections.some((section) => section.type === "diff"));
   const fileNames = useMemo(() => {
     const diffNames = (effectiveContent || [])
       .map((item) => basename(normalizeDisplayPath(item.path || "", rootPath)))
@@ -678,7 +684,15 @@ export const ToolCallCard = memo(function ToolCallCard({
     >
       <button
         type="button"
-        onClick={hasDetails ? () => setExpanded(!expanded) : undefined}
+        onClick={
+          hasDetails
+            ? () => {
+                const next = !expanded;
+                setExpanded(next);
+                if (next) onExpand?.();
+              }
+            : undefined
+        }
         style={{
           width: "100%",
           display: "flex",
@@ -963,7 +977,12 @@ function normalizeDisplayPath(path: string, rootPath?: string): string {
   return path;
 }
 
-function buildDetailSections(content?: ToolCallContentItem[], locations?: ToolCallLocation[], rootPath?: string): DetailSection[] {
+function buildDetailSections(
+  content?: ToolCallContentItem[],
+  locations?: ToolCallLocation[],
+  rootPath?: string,
+  kind?: string,
+): DetailSection[] {
   if (!content || content.length === 0) return [];
   const sections: DetailSection[] = [];
   let locationIndex = 0;
@@ -977,6 +996,15 @@ function buildDetailSections(content?: ToolCallContentItem[], locations?: ToolCa
     if (item.type === "text" && item.text?.trim()) {
       const fallbackPath = normalizeDisplayPath(locations?.[locationIndex]?.path || "(unknown)", rootPath);
       const path = normalizeDisplayPath(item.path || fallbackPath, rootPath);
+      if (kind === "read") {
+        // Read returns raw file text. Rendering it as Markdown turns tabs into
+        // indented code blocks and mangles source code, so show it verbatim in
+        // a fenced code block (highlighted by file extension).
+        const sourcePath = item.path || locations?.[locationIndex]?.path;
+        sections.push({ type: "text", markdown: renderVerbatimCode(item.text, sourcePath) });
+        locationIndex += 1;
+        continue;
+      }
       if (item.changeKind === "add") {
         sections.push({ type: "diff", path, markdown: renderAddedText(path, item.text) });
         locationIndex += 1;
@@ -1000,4 +1028,11 @@ function buildDetailSections(content?: ToolCallContentItem[], locations?: ToolCa
     }
   }
   return sections;
+}
+
+function renderVerbatimCode(text: string, path?: string): string {
+  const language = languageForPath(path || "");
+  const longestFence = (text.match(/`+/g) || []).reduce((longest, run) => Math.max(longest, run.length), 0);
+  const fence = "`".repeat(Math.max(3, longestFence + 1));
+  return `${fence}${language}\n${text}\n${fence}`;
 }

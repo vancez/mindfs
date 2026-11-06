@@ -540,40 +540,46 @@ export function GitStatusPanel({
         <div
           style={{
             display: "flex",
-            alignItems: "center",
+            alignItems: "flex-end",
             gap: "6px",
             marginBottom: "10px",
             padding: compact ? "0 4px 0 0" : "0 10px",
           }}
         >
-          <input
+          <textarea
             value={commitMessage}
             disabled={actionBusy === "commit"}
             autoFocus
+            rows={3}
             placeholder={t("git.commitMessagePlaceholder")}
             onChange={(event) => setCommitMessage(event.target.value)}
             onKeyDown={(event) => {
-              if (event.key === "Enter") {
+              if (event.key === "Escape") {
+                event.preventDefault();
+                setCommitOpen(false);
+                return;
+              }
+              if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
                 if (event.nativeEvent.isComposing) {
                   return;
                 }
                 event.preventDefault();
                 void submitCommit();
-              } else if (event.key === "Escape") {
-                event.preventDefault();
-                setCommitOpen(false);
               }
             }}
             style={{
               flex: 1,
               minWidth: 0,
-              height: "26px",
+              minHeight: "54px",
+              resize: "vertical",
               border: "1px solid var(--border-color)",
               borderRadius: "7px",
               background: "transparent",
               color: "var(--text-primary)",
-              padding: "0 8px",
+              padding: "6px 8px",
+              fontFamily: "inherit",
               fontSize: "12px",
+              lineHeight: 1.45,
               outline: "none",
             }}
           />

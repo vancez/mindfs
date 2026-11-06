@@ -218,6 +218,33 @@ func TestClaudeLocalBashTaskLifecycleIsIgnored(t *testing.T) {
 	}
 }
 
+func TestClaudeToolProgressHeartbeatDetection(t *testing.T) {
+	parent := "call_00_AT1DtZL8sY6waNB01TLv1120"
+	cases := []struct {
+		name      string
+		toolUseID string
+		parentID  *string
+		want      bool
+	}{
+		{name: "parent heartbeat", toolUseID: parent + "-heartbeat-0", parentID: &parent, want: true},
+		{name: "repeated heartbeat", toolUseID: parent + "-heartbeat-12", want: true},
+		{name: "regular progress", toolUseID: parent, parentID: &parent, want: false},
+		{name: "non numeric heartbeat", toolUseID: parent + "-heartbeat-latest", want: false},
+		{name: "empty", want: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := isClaudeToolProgressHeartbeat(claudeagent.ToolProgressMessage{
+				ToolUseID:       tc.toolUseID,
+				ParentToolUseID: tc.parentID,
+			})
+			if got != tc.want {
+				t.Fatalf("isClaudeToolProgressHeartbeat(%q) = %v, want %v", tc.toolUseID, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestSummarizeExecuteToolCallPrefersNaturalLanguageDescription(t *testing.T) {
 	title, meta := summarizeExecuteToolCall("Bash", json.RawMessage(`{
 		"command":"go test ./...",
@@ -449,6 +476,298 @@ func TestSummarizeGenericToolResultJSONString(t *testing.T) {
 	}
 }
 
+func TestToolResultUpdateCapturesReadFileContent(t *testing.T) {
+	callID := "call-read-1"
+	s := &session{
+		pendingToolCalls: map[string]types.ToolCall{
+			callID: {CallID: callID, Status: "running", Kind: types.ToolKindRead},
+		},
+	}
+
+	update, ok := s.toolResultUpdate(claudeagent.UserMessage{
+		ParentToolUseID: &callID,
+		ToolUseResult: map[string]any{
+			"type": "text",
+			"file": map[string]any{
+				"filePath": "main.go",
+				"content":  "package main\n\nfunc main() {}\n",
+			},
+		},
+	})
+	if !ok {
+		t.Fatal("toolResultUpdate returned ok=false")
+	}
+	if len(update.Content) != 1 || update.Content[0].Text != "package main\n\nfunc main() {}\n" {
+		t.Fatalf("content = %#v, want file content", update.Content)
+	}
+	if update.Meta["output"] != "package main\n\nfunc main() {}\n" {
+		t.Fatalf("meta.output = %#v, want file content", update.Meta["output"])
+	}
+}
+
+func TestToolResultUpdateCapturesSearchContentAndFilenames(t *testing.T) {
+	cases := []struct {
+		name string
+		raw  map[string]any
+		want string
+	}{
+		{
+			name: "content mode",
+			raw:  map[string]any{"mode": "content", "content": "main.go:12:func main()"},
+			want: "main.go:12:func main()",
+		},
+		{
+			name: "files with matches",
+			raw:  map[string]any{"mode": "files_with_matches", "filenames": []any{"a.go", "b.go"}},
+			want: "a.go\nb.go",
+		},
+		{
+			name: "no matches",
+			raw:  map[string]any{"mode": "files_with_matches", "filenames": []any{}},
+			want: "No matching files.",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			callID := "call-search-1"
+			s := &session{
+				pendingToolCalls: map[string]types.ToolCall{
+					callID: {CallID: callID, Status: "running", Kind: types.ToolKindSearch},
+				},
+			}
+			update, ok := s.toolResultUpdate(claudeagent.UserMessage{
+				ParentToolUseID: &callID,
+				ToolUseResult:   tc.raw,
+			})
+			if !ok {
+				t.Fatal("toolResultUpdate returned ok=false")
+			}
+			if len(update.Content) != 1 || update.Content[0].Text != tc.want {
+				t.Fatalf("content = %#v, want %q", update.Content, tc.want)
+			}
+		})
+	}
+}
+
+func TestToolResultUpdateCapturesWebSearchLinks(t *testing.T) {
+	callID := "call-web-search-1"
+	s := &session{
+		pendingToolCalls: map[string]types.ToolCall{
+			callID: {CallID: callID, Status: "running", Kind: types.ToolKindWebSearch},
+		},
+	}
+	update, ok := s.toolResultUpdate(claudeagent.UserMessage{
+		ParentToolUseID: &callID,
+		ToolUseResult: map[string]any{
+			"query": "mindfs",
+			"results": []any{
+				map[string]any{
+					"content": []any{
+						map[string]any{"title": "MindFS", "url": "https://example.com/mindfs"},
+					},
+				},
+				"Search summary text",
+			},
+		},
+	})
+	if !ok {
+		t.Fatal("toolResultUpdate returned ok=false")
+	}
+	want := "Search summary text\n\n- [MindFS](https://example.com/mindfs)"
+	if len(update.Content) != 1 || update.Content[0].Text != want {
+		t.Fatalf("content = %#v, want %q", update.Content, want)
+	}
+}
+
+func TestToolResultUpdateCapturesFetchTextResult(t *testing.T) {
+	callID := "call-fetch-1"
+	s := &session{
+		pendingToolCalls: map[string]types.ToolCall{
+			callID: {CallID: callID, Status: "running", Kind: types.ToolKindFetch},
+		},
+	}
+	update, ok := s.toolResultUpdate(claudeagent.UserMessage{
+		ParentToolUseID: &callID,
+		ToolUseResult:   "fetched page text",
+	})
+	if !ok {
+		t.Fatal("toolResultUpdate returned ok=false")
+	}
+	if len(update.Content) != 1 || update.Content[0].Text != "fetched page text" {
+		t.Fatalf("content = %#v, want fetched page text", update.Content)
+	}
+}
+
+func TestToolResultUpdateMatchesParallelCallsByKind(t *testing.T) {
+	s := &session{}
+	read := types.ToolCall{CallID: "read-1", Status: "running", Kind: types.ToolKindRead, Meta: map[string]any{"filePath": "a.ts"}}
+	command := types.ToolCall{CallID: "exec-1", Status: "running", Kind: types.ToolKindExecute, Meta: map[string]any{"command": "ls"}}
+	s.trackPendingToolCall(read)
+	s.trackPendingToolCall(command)
+
+	update, ok := s.toolResultUpdate(claudeagent.UserMessage{
+		ToolUseResult: map[string]any{"stdout": "file-a.ts\n", "stderr": ""},
+	})
+	if !ok {
+		t.Fatal("toolResultUpdate returned ok=false")
+	}
+	if update.CallID != "exec-1" {
+		t.Fatalf("update call id = %q, want exec-1", update.CallID)
+	}
+	if len(update.Content) != 1 || update.Content[0].Text != "file-a.ts\n" {
+		t.Fatalf("content = %#v, want command stdout", update.Content)
+	}
+	if !s.hasPendingToolCall("read-1") {
+		t.Fatal("read call should still be pending")
+	}
+}
+
+func TestToolResultUpdateMatchesParallelReadsByFilePath(t *testing.T) {
+	s := &session{}
+	s.trackPendingToolCall(types.ToolCall{CallID: "read-1", Status: "running", Kind: types.ToolKindRead, Meta: map[string]any{"filePath": "a.ts"}})
+	s.trackPendingToolCall(types.ToolCall{CallID: "read-2", Status: "running", Kind: types.ToolKindRead, Meta: map[string]any{"filePath": "b.ts"}})
+
+	update, ok := s.toolResultUpdate(claudeagent.UserMessage{
+		ToolUseResult: map[string]any{
+			"type": "text",
+			"file": map[string]any{"filePath": "b.ts", "content": "B CONTENT"},
+		},
+	})
+	if !ok {
+		t.Fatal("toolResultUpdate returned ok=false")
+	}
+	if update.CallID != "read-2" {
+		t.Fatalf("update call id = %q, want read-2", update.CallID)
+	}
+	if len(update.Content) != 1 || update.Content[0].Text != "B CONTENT" {
+		t.Fatalf("content = %#v, want B CONTENT", update.Content)
+	}
+	if !s.hasPendingToolCall("read-1") {
+		t.Fatal("read-1 should still be pending")
+	}
+}
+
+func TestToolResultUpdateDrainsAmbiguousParallelCalls(t *testing.T) {
+	s := &session{}
+	s.trackPendingToolCall(types.ToolCall{CallID: "exec-1", Status: "running", Kind: types.ToolKindExecute, Meta: map[string]any{"command": "sleep 2"}})
+	s.trackPendingToolCall(types.ToolCall{CallID: "exec-2", Status: "running", Kind: types.ToolKindExecute, Meta: map[string]any{"command": "echo FAST"}})
+
+	first, ok := s.toolResultUpdate(claudeagent.UserMessage{
+		ToolUseResult: map[string]any{"stdout": "FAST\n", "stderr": ""},
+	})
+	if !ok {
+		t.Fatal("first toolResultUpdate returned ok=false")
+	}
+	second, ok := s.toolResultUpdate(claudeagent.UserMessage{
+		ToolUseResult: map[string]any{"stdout": "SLOW\n", "stderr": ""},
+	})
+	if !ok {
+		t.Fatal("second toolResultUpdate returned ok=false")
+	}
+	if first.CallID == second.CallID {
+		t.Fatalf("both results mapped to %q", first.CallID)
+	}
+	if len(s.pendingToolCalls) != 0 {
+		t.Fatalf("pending calls after both results = %#v, want empty", s.pendingToolCalls)
+	}
+}
+
+func TestToolResultUpdateCompletesSubagentCall(t *testing.T) {
+	parentID := "agent-call"
+	s := &session{}
+	s.trackPendingToolCall(types.ToolCall{CallID: parentID, Status: "running", Kind: types.ToolKindTask, Meta: map[string]any{"prompt": "do work"}})
+	s.trackPendingToolCall(types.ToolCall{
+		CallID: "sub-exec-1",
+		Status: "running",
+		Kind:   types.ToolKindExecute,
+		Meta:   map[string]any{"command": "echo hi", "parentToolUseId": parentID},
+	})
+
+	update, ok := s.toolResultUpdate(claudeagent.UserMessage{
+		ParentToolUseID: &parentID,
+		ToolUseResult:   nil,
+		Message: claudeagent.APIUserMessage{
+			Role:    "user",
+			Content: []claudeagent.UserContentBlock{{Type: "tool_result"}},
+		},
+	})
+	if !ok {
+		t.Fatal("toolResultUpdate returned ok=false")
+	}
+	if update.CallID != "sub-exec-1" || update.Status != "complete" {
+		t.Fatalf("update = %#v, want subagent call completed", update)
+	}
+	if !s.hasPendingToolCall(parentID) {
+		t.Fatal("parent Task call should still be pending")
+	}
+}
+
+func TestToolResultUpdateMatchesSubagentResultByParent(t *testing.T) {
+	parentID := "agent-call"
+	s := &session{}
+	s.trackPendingToolCall(types.ToolCall{CallID: parentID, Status: "running", Kind: types.ToolKindTask, Meta: map[string]any{"prompt": "do work"}})
+	s.trackPendingToolCall(types.ToolCall{
+		CallID: "sub-exec-1",
+		Status: "running",
+		Kind:   types.ToolKindExecute,
+		Meta:   map[string]any{"command": "echo hi", "parentToolUseId": parentID},
+	})
+
+	update, ok := s.toolResultUpdate(claudeagent.UserMessage{
+		ParentToolUseID: &parentID,
+		ToolUseResult:   map[string]any{"stdout": "hi\n", "stderr": ""},
+	})
+	if !ok {
+		t.Fatal("toolResultUpdate returned ok=false")
+	}
+	if update.CallID != "sub-exec-1" {
+		t.Fatalf("update call id = %q, want sub-exec-1", update.CallID)
+	}
+	if !s.hasPendingToolCall(parentID) {
+		t.Fatal("parent Task call should still be pending")
+	}
+}
+
+func TestToolResultUpdateDoesNotLetStringResultPopReadCall(t *testing.T) {
+	s := &session{}
+	s.trackPendingToolCall(types.ToolCall{CallID: "read-1", Status: "running", Kind: types.ToolKindRead, Meta: map[string]any{"filePath": "a.ts"}})
+	s.trackPendingToolCall(types.ToolCall{CallID: "fetch-1", Status: "running", Kind: types.ToolKindFetch, Meta: map[string]any{}})
+
+	update, ok := s.toolResultUpdate(claudeagent.UserMessage{
+		ToolUseResult: "fetched text",
+	})
+	if !ok {
+		t.Fatal("toolResultUpdate returned ok=false")
+	}
+	if update.CallID != "fetch-1" {
+		t.Fatalf("update call id = %q, want fetch-1", update.CallID)
+	}
+	if !s.hasPendingToolCall("read-1") {
+		t.Fatal("read call should still be pending")
+	}
+}
+
+func TestToolResultUpdateMatchesTaskListCalls(t *testing.T) {
+	s := &session{}
+	agent := types.ToolCall{CallID: "agent-call", Status: "running", Kind: types.ToolKindTask, Meta: map[string]any{"prompt": "work"}}
+	create := types.ToolCall{CallID: "create-call", Status: "running", Kind: types.ToolKindTask, Meta: map[string]any{"taskTool": "TaskCreate"}}
+	s.trackPendingToolCall(agent)
+	s.trackPendingToolCall(create)
+
+	update, ok := s.toolResultUpdate(claudeagent.UserMessage{
+		ToolUseResult: map[string]any{"task": map[string]any{"id": "7", "subject": "Check"}},
+	})
+	if !ok {
+		t.Fatal("toolResultUpdate returned ok=false")
+	}
+	if update.CallID != "claude-task-list:7" {
+		t.Fatalf("update call id = %q, want task list create update", update.CallID)
+	}
+	if !s.hasPendingToolCall("agent-call") {
+		t.Fatal("agent call should still be pending")
+	}
+}
+
 func TestToolResultUpdateFallsBackToOnlyPendingTool(t *testing.T) {
 	s := &session{
 		pendingToolCalls: map[string]types.ToolCall{
@@ -471,5 +790,101 @@ func TestToolResultUpdateFallsBackToOnlyPendingTool(t *testing.T) {
 	}
 	if len(update.Content) != 1 || !strings.Contains(update.Content[0].Text, "command output") {
 		t.Fatalf("content = %#v, want command output", update.Content)
+	}
+}
+
+func TestClaudePartialContextEmitsLiveUpdate(t *testing.T) {
+	var events []types.Event
+	s := &session{
+		sessionID: "claude-session",
+		context:   types.ContextWindow{ModelContextWindow: 200_000},
+		onUpdate:  func(event types.Event) { events = append(events, event) },
+	}
+	raw, err := json.Marshal(map[string]any{
+		"type": "message_start",
+		"message": map[string]any{
+			"usage": map[string]any{
+				"input_tokens":                12,
+				"cache_read_input_tokens":     90,
+				"cache_creation_input_tokens": 8,
+			},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	s.handlePartialAssistantMessage(raw, subagentMeta{})
+	if len(events) != 1 || events[0].Type != types.EventTypeContextUpdate {
+		t.Fatalf("events = %#v, want one context update", events)
+	}
+	update, ok := events[0].Data.(types.ContextUpdate)
+	if !ok {
+		t.Fatalf("event data = %T, want ContextUpdate", events[0].Data)
+	}
+	if update.ContextWindow.TotalTokens != 110 || update.ContextWindow.ModelContextWindow != 200_000 {
+		t.Fatalf("context update = %#v", update.ContextWindow)
+	}
+
+	s.handlePartialAssistantMessage(raw, subagentMeta{})
+	if len(events) != 1 {
+		t.Fatalf("unchanged context emitted another update: %#v", events)
+	}
+
+	s.handlePartialAssistantMessage(raw, subagentMeta{ParentToolUseID: "tool-1"})
+	if len(events) != 1 {
+		t.Fatalf("subagent context leaked into parent updates: %#v", events)
+	}
+
+	delta, err := json.Marshal(map[string]any{
+		"type": "message_delta",
+		"usage": map[string]any{
+			"input_tokens":            20,
+			"cache_read_input_tokens": 100,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.handlePartialAssistantMessage(delta, subagentMeta{})
+	if len(events) != 2 {
+		t.Fatalf("events = %#v, want a second context update", events)
+	}
+	update, ok = events[1].Data.(types.ContextUpdate)
+	if !ok || update.ContextWindow.TotalTokens != 120 {
+		t.Fatalf("delta context update = %#v", events[1].Data)
+	}
+}
+
+func TestClaudePartialContextEmitsBeforeModelWindowKnown(t *testing.T) {
+	var events []types.Event
+	s := &session{
+		sessionID: "claude-session",
+		onUpdate:  func(event types.Event) { events = append(events, event) },
+	}
+	raw, err := json.Marshal(map[string]any{
+		"type": "message_start",
+		"message": map[string]any{
+			"usage": map[string]any{
+				"input_tokens":                42,
+				"cache_read_input_tokens":     900,
+				"cache_creation_input_tokens": 58,
+			},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	s.handlePartialAssistantMessage(raw, subagentMeta{})
+	if len(events) != 1 || events[0].Type != types.EventTypeContextUpdate {
+		t.Fatalf("events = %#v, want one context update", events)
+	}
+	update, ok := events[0].Data.(types.ContextUpdate)
+	if !ok {
+		t.Fatalf("event data = %T, want ContextUpdate", events[0].Data)
+	}
+	if update.ContextWindow.TotalTokens != 1000 || update.ContextWindow.ModelContextWindow != 0 {
+		t.Fatalf("context update = %#v", update.ContextWindow)
 	}
 }

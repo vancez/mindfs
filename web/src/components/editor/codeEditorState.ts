@@ -9,21 +9,21 @@ export const editorReadOnly = new Compartment();
 export const editorContentAttributes = new Compartment();
 
 const highlighting = HighlightStyle.define([
-  { tag: tags.comment, color: "var(--file-code-comment)" },
-  { tag: [tags.keyword, tags.modifier], color: "var(--file-code-keyword)" },
-  { tag: [tags.string, tags.special(tags.string), tags.regexp], color: "var(--file-code-string)" },
-  { tag: [tags.number, tags.bool, tags.null, tags.atom], color: "var(--file-code-number)" },
-  { tag: [tags.typeName, tags.className, tags.namespace, tags.tagName], color: "var(--file-code-type)" },
-  { tag: [tags.function(tags.variableName), tags.function(tags.propertyName)], color: "var(--file-code-function)" },
-  { tag: [tags.propertyName, tags.attributeName], color: "var(--file-code-property)" },
-  { tag: [tags.operator, tags.punctuation], color: "var(--text-secondary)" },
-  { tag: tags.meta, color: "var(--file-code-keyword)" },
-  { tag: tags.heading, color: "var(--file-code-keyword)", fontWeight: "600" },
-  { tag: tags.link, color: "var(--file-code-function)", textDecoration: "underline" },
+  { tag: tags.comment, color: "var(--code-token-comment)" },
+  { tag: [tags.keyword, tags.modifier], color: "var(--code-token-keyword)" },
+  { tag: [tags.string, tags.special(tags.string), tags.regexp], color: "var(--code-token-string)" },
+  { tag: [tags.number, tags.bool, tags.null, tags.atom], color: "var(--code-token-number)" },
+  { tag: [tags.typeName, tags.className, tags.namespace, tags.tagName], color: "var(--code-token-type)" },
+  { tag: [tags.function(tags.variableName), tags.function(tags.propertyName)], color: "var(--code-token-function)" },
+  { tag: [tags.propertyName, tags.attributeName], color: "var(--code-token-property)" },
+  { tag: [tags.operator, tags.punctuation], color: "var(--code-token-punctuation)" },
+  { tag: tags.meta, color: "var(--code-token-keyword)" },
+  { tag: tags.heading, color: "var(--code-token-keyword)", fontWeight: "600" },
+  { tag: tags.link, color: "var(--code-token-function)", textDecoration: "underline" },
   { tag: tags.emphasis, fontStyle: "italic" },
   { tag: tags.strong, fontWeight: "600" },
   { tag: tags.strikethrough, textDecoration: "line-through" },
-  { tag: tags.invalid, color: "var(--file-code-invalid)" },
+  { tag: tags.invalid, color: "var(--code-token-invalid)" },
 ]);
 
 export function codeEditorAttributes(label: string) {

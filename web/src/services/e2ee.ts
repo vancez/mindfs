@@ -1,4 +1,12 @@
 import { appURL } from "./base";
+import {
+  buildEnvelopeAAD,
+  buildRequestProof,
+  buildWSAAD,
+  generateRequestNonce,
+  REQUEST_NONCE_HEADER,
+} from "./e2eeProof";
+import { responseProtectionError } from "./e2eeResponse";
 
 const SECRET_STORAGE_PREFIX = "mindfs.e2ee.secret.";
 export const E2EE_HEADER = "X-MindFS-E2EE";
@@ -33,10 +41,30 @@ type SessionContext = {
   transportKeyBytes: Uint8Array;
 };
 
+export type E2EEResponseContext = {
+  method: string;
+  path: string;
+  nonce: string;
+  key: CryptoKey;
+  keyBytes: Uint8Array;
+  clientId: string;
+};
+
 type ProtectedRequest = {
   init: RequestInit;
   session: SessionContext;
+  context: E2EEResponseContext;
 };
+
+export type FileProofContext = {
+  headers: Headers;
+  nonce: string;
+  key: CryptoKey;
+  keyBytes: Uint8Array;
+  context: E2EEResponseContext;
+};
+
+const responseContexts = new WeakMap<Response, E2EEResponseContext>();
 
 export type NativeE2EESession = {
   required: boolean;
@@ -168,39 +196,24 @@ class E2EEService {
     }
   }
 
-  async encryptEnvelope(value: unknown): Promise<CipherEnvelope | null> {
-    const session = await this.ensureSession();
-    if (!session) return null;
-    return encryptJSON(session.transportKey, value);
-  }
-
-  async decryptEnvelope<T>(envelope: CipherEnvelope): Promise<T> {
+  async encodeWSMessage(value: unknown, sequence: number): Promise<string> {
     const session = await this.ensureSession();
     if (!session) {
       throw new Error("e2ee_required");
     }
-    return decryptJSON<T>(session.transportKey, envelope);
-  }
-
-  async encodeProtectedJSON(value: unknown): Promise<string> {
-    const envelope = await this.encryptEnvelope(value);
-    if (!envelope) {
-      throw new Error("e2ee_required");
-    }
+    const plaintext = new TextEncoder().encode(JSON.stringify(value));
+    const envelope = await encryptBytes(session.transportKey, plaintext, buildWSAAD("c2s", sequence));
     return JSON.stringify(envelope);
   }
 
-  async decodeProtectedJSON<T>(raw: string): Promise<T> {
+  async decodeWSMessage<T>(raw: string, sequence: number): Promise<T> {
+    const session = await this.ensureSession();
+    if (!session) {
+      throw new Error("e2ee_required");
+    }
     const envelope = JSON.parse(raw) as CipherEnvelope;
-    return this.decryptEnvelope<T>(envelope);
-  }
-
-  async encodeWSMessage(value: unknown): Promise<string> {
-    return this.encodeProtectedJSON(value);
-  }
-
-  async decodeWSMessage<T>(raw: string): Promise<T> {
-    return this.decodeProtectedJSON<T>(raw);
+    const plaintext = await decryptBytes(session.transportKey, envelope, buildWSAAD("s2c", sequence));
+    return JSON.parse(new TextDecoder().decode(plaintext)) as T;
   }
 
   async wsProofParams(method: string, path: string): Promise<URLSearchParams> {
@@ -209,11 +222,13 @@ class E2EEService {
       throw new Error("e2ee_required");
     }
     const ts = new Date().toISOString();
+    const nonce = generateRequestNonce();
     const proofPath = canonicalProofPath(path);
-    const proof = await buildRequestProof(session.transportKeyBytes, method, proofPath, ts, this.clientId);
+    const proof = await buildRequestProof(session.transportKeyBytes, method, proofPath, ts, nonce, this.clientId);
     return new URLSearchParams({
       e2ee_ts: ts,
       e2ee_proof: proof,
+      e2ee_nonce: nonce,
     });
   }
 
@@ -224,41 +239,94 @@ class E2EEService {
     return next;
   }
 
-  async fileProofHeaders(method: string, path: string, headers?: HeadersInit): Promise<Headers> {
+  async fileProofContext(method: string, path: string, headers?: HeadersInit): Promise<FileProofContext> {
     const session = await this.ensureSession();
     if (!session) {
       throw new Error("e2ee_required");
     }
+    const normalizedMethod = String(method || "GET").toUpperCase();
     const ts = new Date().toISOString();
+    const nonce = generateRequestNonce();
     const proofPath = canonicalProofPath(path);
-    const proof = await buildRequestProof(session.transportKeyBytes, method, proofPath, ts, this.clientId);
+    const proof = await buildRequestProof(session.transportKeyBytes, normalizedMethod, proofPath, ts, nonce, this.clientId);
     const next = new Headers(headers);
     next.set(CLIENT_ID_HEADER, this.clientId);
     next.set(TS_HEADER, ts);
     next.set(PROOF_HEADER, proof);
-    return next;
+    next.set(REQUEST_NONCE_HEADER, nonce);
+    const keyBytes = session.transportKeyBytes.slice();
+    return {
+      headers: next,
+      nonce,
+      key: session.transportKey,
+      keyBytes,
+      context: {
+        method: normalizedMethod,
+        path: proofPath,
+        nonce,
+        key: session.transportKey,
+        keyBytes,
+        clientId: this.clientId,
+      },
+    };
   }
 
-  private async requestProofHeaders(session: SessionContext, method: string, input: RequestInfo | URL, headers?: HeadersInit): Promise<Headers> {
+  private async requestProofContext(
+    session: SessionContext,
+    method: string,
+    input: RequestInfo | URL,
+    headers?: HeadersInit,
+  ): Promise<{ headers: Headers; context: E2EEResponseContext }> {
     const ts = new Date().toISOString();
+    const nonce = generateRequestNonce();
     const requestURL = input instanceof Request ? input.url : String(input);
     const proofPath = canonicalProofPath(requestURL);
-    const proof = await buildRequestProof(session.transportKeyBytes, method, proofPath, ts, this.clientId);
+    const proof = await buildRequestProof(session.transportKeyBytes, method, proofPath, ts, nonce, this.clientId);
     const next = this.sessionProtectedHeaders(headers);
     next.set(TS_HEADER, ts);
+    next.set(REQUEST_NONCE_HEADER, nonce);
     next.set(PROOF_HEADER, proof);
-    return next;
+    const keyBytes = session.transportKeyBytes.slice();
+    return {
+      headers: next,
+      context: {
+        method,
+        path: proofPath,
+        nonce,
+        key: session.transportKey,
+        keyBytes,
+        clientId: this.clientId,
+      },
+    };
   }
 
   isProtectedJSONResponse(response: Response): boolean {
     return String(response.headers.get(E2EE_HEADER) || "").trim() === "1";
   }
 
-  async parseProtectedJSONResponse<T>(response: Response): Promise<T> {
-    if (!this.isProtectedJSONResponse(response)) {
-      return response.json() as Promise<T>;
+  async parseProtectedJSONResponse<T>(
+    response: Response,
+    options: { context?: E2EEResponseContext; allowPlaintext?: boolean } = {},
+  ): Promise<T> {
+    const context = options.context || responseContexts.get(response);
+    const protectedResponse = this.isProtectedJSONResponse(response);
+    const protectionError = responseProtectionError({
+      required: this.isRequired(),
+      ok: response.ok,
+      protectedResponse,
+      hasContext: !!context,
+      allowPlaintext: options.allowPlaintext,
+    });
+    if (protectionError) {
+      throw new Error(protectionError);
     }
-    return this.decodeProtectedJSON<T>(await response.text());
+    if (protectedResponse && context) {
+      const envelope = JSON.parse(await response.text()) as CipherEnvelope;
+      const aad = buildEnvelopeAAD("response", context.method, context.path, context.nonce);
+      const plaintext = await decryptBytes(context.key, envelope, aad);
+      return JSON.parse(new TextDecoder().decode(plaintext)) as T;
+    }
+    return response.json() as Promise<T>;
   }
 
   async protectedFetch(input: RequestInfo | URL, init: RequestInit = {}): Promise<Response> {
@@ -274,6 +342,7 @@ class E2EEService {
         response = await fetch(input, request.init);
       }
     }
+    responseContexts.set(response, request.context);
     return response;
   }
 
@@ -283,15 +352,24 @@ class E2EEService {
       throw new Error("e2ee_required");
     }
     const method = String(init.method || (input instanceof Request ? input.method : "GET")).toUpperCase();
-    const headers = await this.requestProofHeaders(session, method, input, init.headers || (input instanceof Request ? input.headers : undefined));
+    const { headers, context } = await this.requestProofContext(
+      session,
+      method,
+      input,
+      init.headers || (input instanceof Request ? input.headers : undefined),
+    );
     const next: RequestInit = { ...init, method, headers };
     if (init.body !== undefined && init.body !== null && method !== "GET" && method !== "HEAD") {
       const plaintext = protectedBodyText(init.body);
-      const envelope = await encryptBytes(session.transportKey, new TextEncoder().encode(plaintext));
+      const envelope = await encryptBytes(
+        session.transportKey,
+        new TextEncoder().encode(plaintext),
+        buildEnvelopeAAD("request", method, context.path, context.nonce),
+      );
       next.body = JSON.stringify(envelope);
       headers.set("Content-Type", "application/json");
     }
-    return { init: next, session };
+    return { init: next, session, context };
   }
 
   private async recoverProtectedSession(code: string, failedSession: SessionContext): Promise<boolean> {
@@ -331,7 +409,7 @@ class E2EEService {
   async protectedJSON<T>(input: RequestInfo | URL, init: RequestInit = {}): Promise<T> {
     const response = await this.protectedFetch(input, init);
     if (!response.ok) {
-      const payload = await this.parseProtectedJSONResponse<{ error?: string; message?: string }>(response.clone()).catch((): { error?: string; message?: string } => ({}));
+      const payload = await this.parseProtectedJSONResponse<{ error?: string; message?: string }>(response).catch((): { error?: string; message?: string } => ({}));
       throw new Error(String(payload.message || payload.error || `request failed: ${response.status}`));
     }
     return this.parseProtectedJSONResponse<T>(response);
@@ -506,19 +584,14 @@ async function buildHmacProof(secret: string, label: string, parts: string[]): P
   return encodeBase64(new Uint8Array(signature));
 }
 
-async function encryptJSON(key: CryptoKey, value: unknown): Promise<CipherEnvelope> {
-  return encryptBytes(key, new TextEncoder().encode(JSON.stringify(value)));
-}
-
-async function decryptJSON<T>(key: CryptoKey, envelope: CipherEnvelope): Promise<T> {
-  const plaintext = await decryptBytes(key, envelope);
-  return JSON.parse(new TextDecoder().decode(plaintext)) as T;
-}
-
-async function encryptBytes(key: CryptoKey, bytes: Uint8Array): Promise<CipherEnvelope> {
+async function encryptBytes(key: CryptoKey, bytes: Uint8Array, aad?: Uint8Array): Promise<CipherEnvelope> {
   const nonce = crypto.getRandomValues(new Uint8Array(12));
   const ciphertext = await crypto.subtle.encrypt(
-    { name: "AES-GCM", iv: nonce },
+    {
+      name: "AES-GCM",
+      iv: nonce,
+      additionalData: aad ? toArrayBuffer(aad) : undefined,
+    },
     key,
     toArrayBuffer(bytes),
   );
@@ -528,9 +601,13 @@ async function encryptBytes(key: CryptoKey, bytes: Uint8Array): Promise<CipherEn
   };
 }
 
-async function decryptBytes(key: CryptoKey, envelope: CipherEnvelope): Promise<Uint8Array> {
+async function decryptBytes(key: CryptoKey, envelope: CipherEnvelope, aad?: Uint8Array): Promise<Uint8Array> {
   const plaintext = await crypto.subtle.decrypt(
-    { name: "AES-GCM", iv: toArrayBuffer(decodeBase64(envelope.nonce)) },
+    {
+      name: "AES-GCM",
+      iv: toArrayBuffer(decodeBase64(envelope.nonce)),
+      additionalData: aad ? toArrayBuffer(aad) : undefined,
+    },
     key,
     toArrayBuffer(decodeBase64(envelope.ciphertext)),
   );
@@ -539,19 +616,6 @@ async function decryptBytes(key: CryptoKey, envelope: CipherEnvelope): Promise<U
 
 async function importAesKey(raw: Uint8Array): Promise<CryptoKey> {
   return crypto.subtle.importKey("raw", toArrayBuffer(raw), { name: "AES-GCM" }, false, ["encrypt", "decrypt"]);
-}
-
-async function buildRequestProof(key: Uint8Array, method: string, path: string, ts: string, clientId: string): Promise<string> {
-  const hmacKey = await crypto.subtle.importKey(
-    "raw",
-    toArrayBuffer(key),
-    { name: "HMAC", hash: "SHA-256" },
-    false,
-    ["sign"],
-  );
-  const digest = await sha256Bytes(["mindfs-request-proof", method, path, ts, clientId].join("\x1f"));
-  const signature = await crypto.subtle.sign("HMAC", hmacKey, toArrayBuffer(digest));
-  return encodeBase64(new Uint8Array(signature));
 }
 
 async function hkdfBytes(secret: Uint8Array, salt: Uint8Array | ArrayBuffer | null, info: Uint8Array | ArrayBuffer, length: number): Promise<Uint8Array> {

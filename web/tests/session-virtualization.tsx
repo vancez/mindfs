@@ -99,8 +99,123 @@ Object.assign(window, { runScrollIntentChecks: async () => {
     (window as any).check.append();
     await settle();
     assert(gap() < 2, `${input}: returning to bottom did not resume following`);
+
+    // Gestures that never move the view off the tail (lateral swipe, finger
+    // jitter, stray wheel tick) must not surface the jump button or leave
+    // following paused.
+    const jumpButton = () =>
+      document.querySelector('[data-mindfs-jump-latest="1"]') ||
+      [...document.querySelectorAll('button')].find((node) =>
+        /回到底部最新消息|Jump to latest message/.test(node.getAttribute('aria-label') || ''),
+      );
+    assert(!jumpButton(), `${input}: jump button visible at the tail`);
+    if (input === 'touch') {
+      const fireTouch = (type: string, clientX: number, clientY: number) =>
+        el.dispatchEvent(new TouchEvent(type, {
+          bubbles: true,
+          cancelable: true,
+          touches: type === 'touchend'
+            ? []
+            : [new Touch({identifier: 1, target: el, clientX, clientY})],
+        }));
+      fireTouch('touchstart', 100, 300);
+      fireTouch('touchmove', 160, 300);
+      fireTouch('touchmove', 220, 301); // lateral swipe with 1px downward drift
+      fireTouch('touchend', 220, 301);
+      await settle();
+      assert(!jumpButton(), `${input}: lateral swipe at the tail surfaced the jump button`);
+      fireTouch('touchstart', 100, 300);
+      fireTouch('touchmove', 100, 303); // 3px finger jitter
+      fireTouch('touchend', 100, 303);
+    } else {
+      el.dispatchEvent(new WheelEvent('wheel', {bubbles: true, deltaY: -5}));
+    }
+    await settle();
+    assert(!jumpButton(), `${input}: tail gesture surfaced the jump button`);
+    (window as any).check.append();
+    await settle();
+    assert(gap() < 2, `${input}: tail gesture stopped following`);
+
+    // The end of an overscroll bounce reads as upward movement while the
+    // viewport is back at the tail. Following must stay on and the jump
+    // button must hide immediately, without waiting for the settle timer.
+    el.scrollTop -= 3;
+    await settle(80);
+    assert(!jumpButton(), `${input}: tail bounce surfaced the jump button`);
+    (window as any).check.append();
+    await settle(80);
+    assert(gap() < 2, `${input}: tail bounce should resume following immediately`);
   }
   return {passed: true, inputs: ['wheel', 'touch'], upwardSteps: 12};
+}});
+
+// Guards the transcript tail clearance: at the bottom the floating
+// user-message-summary control (and its count badge) must sit below the last
+// visible message so the right edge of a reply is clear of the button.
+Object.assign(window, { runTailClearanceChecks: async () => {
+  const settle = (ms = 300) => new Promise(resolve => setTimeout(resolve, ms));
+  const assert = (condition: boolean, message: string) => { if (!condition) throw new Error(message); };
+  const scroller = () => [...document.querySelectorAll('div')].find(node => getComputedStyle(node).overflowY === 'auto')!;
+  const el = scroller();
+  el.scrollTop = el.scrollHeight;
+  await settle();
+
+  const summary = document.querySelector('[data-mindfs-user-summary="1"]') as HTMLElement | null;
+  const count = document.querySelector('[data-mindfs-user-summary-count="1"]') as HTMLElement | null;
+  assert(!!summary && !!count, 'Missing user-summary control');
+  const rows = [...document.querySelectorAll<HTMLElement>('[data-session-seq]')];
+  assert(rows.length > 0, 'Missing transcript rows');
+  const transcriptBottom = Math.max(...rows.map(node => node.getBoundingClientRect().bottom));
+  const controlsTop = Math.min(
+    summary!.getBoundingClientRect().top,
+    count!.getBoundingClientRect().top,
+  );
+  assert(
+    transcriptBottom <= controlsTop,
+    `Transcript tail (${Math.round(transcriptBottom)}px) overlaps summary controls (top ${Math.round(controlsTop)}px)`,
+  );
+  return {passed: true, clearance: Math.round(controlsTop - transcriptBottom)};
+}});
+
+// Guards the layout-mode swap: when tools push the timeline across the
+// 100-item virtualization threshold while the reader is paused, the reading
+// offset must survive. The virtualizer rebuilds its scroll body from size
+// estimates; without recording the regular list's measured heights the
+// transcript resets to the first message.
+Object.assign(window, { runVirtualizationSwitchChecks: async () => {
+  const settle = (ms = 400) => new Promise(resolve => setTimeout(resolve, ms));
+  const assert = (condition: boolean, message: string) => { if (!condition) throw new Error(message); };
+  const scroller = () => [...document.querySelectorAll('div')].find(node => getComputedStyle(node).overflowY === 'auto')!;
+  const el = scroller();
+  const tall = (i: number, role: string) =>
+    `${role} ${i}\n` + Array.from({ length: 24 }, (_, line) => `Line ${line} of a fairly tall message for ${role} ${i}`).join('\n\n');
+  const exchanges: any[] = [];
+  for (let i = 0; i < 48; i += 1) {
+    exchanges.push({ seq: i * 2 + 1, role: 'user', content: tall(i, 'user'), timestamp: '2026-09-28T00:00:00Z' });
+    exchanges.push({ seq: i * 2 + 2, role: 'agent', content: tall(i, 'agent'), timestamp: '2026-09-28T00:00:01Z' });
+  }
+  (window as any).check.replaceSession({ key: 'switch-test', exchanges, exchange_aux: {} });
+  await settle();
+  assert(document.querySelectorAll('[data-index]').length === 0, 'Fixture should start in the regular list');
+  el.scrollTop = el.scrollHeight;
+  await settle();
+  el.scrollTop = Math.max(0, el.scrollHeight - el.clientHeight - 4000);
+  await settle();
+  const readingTop = el.scrollTop;
+
+  const busy = [...exchanges, { seq: 97, role: 'user', content: 'Cross the virtualization threshold', timestamp: '2026-09-28T00:01:00Z' }];
+  for (let i = 0; i < 4; i += 1) {
+    busy.push({ role: 'tool', content: '', toolCall: { callId: `switch-${i}`, kind: 'read', status: 'complete', title: `Tool ${i}`, meta: {} }, timestamp: `2026-09-28T00:01:0${i + 2}Z` });
+  }
+  (window as any).check.replaceSession({ key: 'switch-test', exchanges: busy, exchange_aux: {} });
+  await settle(900);
+  assert(document.querySelectorAll('[data-index]').length > 0, 'Timeline should now be virtualized');
+  const after = el.scrollTop;
+  assert(
+    Math.abs(after - readingTop) < 80,
+    `Reading offset moved across the virtualization switch: ${Math.round(readingTop)} -> ${Math.round(after)}`,
+  );
+  return { passed: true, before: Math.round(readingTop), after: Math.round(after) };
 }});
 
 // Run via a browser console or agent-browser eval. No server/agent data is used.

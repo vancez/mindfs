@@ -111,7 +111,9 @@ func TestACPUsageUpdateReplacesCurrentContextUsage(t *testing.T) {
 		ModelContextWindow: 512_000,
 	}}
 
-	state.setUsageUpdate(217_991, 512_000)
+	if changed := state.setUsageUpdate(217_991, 512_000); !changed {
+		t.Fatal("first usage update did not report a change")
+	}
 	got := state.getContextWindow()
 	if got.TotalTokens != 217_991 || got.ModelContextWindow != 512_000 {
 		t.Fatalf("context window after first update = %#v", got)
@@ -119,8 +121,13 @@ func TestACPUsageUpdateReplacesCurrentContextUsage(t *testing.T) {
 	if !state.hasContextUsageUpdate() {
 		t.Fatal("usage update was not marked authoritative")
 	}
+	if changed := state.setUsageUpdate(217_991, 512_000); changed {
+		t.Fatal("unchanged usage update reported a change")
+	}
 
-	state.setUsageUpdate(220_104, 512_000)
+	if changed := state.setUsageUpdate(220_104, 512_000); !changed {
+		t.Fatal("second usage update did not report a change")
+	}
 	got = state.getContextWindow()
 	if got.TotalTokens != 220_104 || got.ModelContextWindow != 512_000 {
 		t.Fatalf("context window after second update = %#v", got)

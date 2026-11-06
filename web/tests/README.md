@@ -12,6 +12,11 @@ Start `npm run dev` in `web`, then open `/tests/session-virtualization.html`.
 Run `await window.runVirtualizationChecks()` in the browser console on a fresh page.
 It throws on failure and returns measured row/request counts on success.
 
+Run `await window.runVirtualizationSwitchChecks()` on a fresh page to verify
+that a paused reader keeps their offset when tools push the timeline across the
+100-item virtualization threshold (the regular list's measured row heights seed
+the virtualizer instead of resetting the transcript to the first message).
+
 Run `await window.runStreamingTextChecks()` to check 16 content/timestamp updates
 in both short and virtualized histories. The row, Markdown wrapper, unchanged
 paragraph, and code block must retain their DOM identity while text updates.
@@ -19,8 +24,14 @@ paragraph, and code block must retain their DOM identity while text updates.
 On a fresh page, run `await window.runScrollIntentChecks()` for slow upward
 scrolling from the tail. It dispatches wheel/touch intent and applies twelve
 5px scroll steps, then checks reading-position retention during append/viewport
-changes and automatic following after returning to the bottom. Run it at desktop
+changes and automatic following after returning to the bottom. It also checks
+that lateral swipes, finger jitter, and stray wheel ticks at the tail neither
+surface the jump button nor leave following paused. Run it at desktop
 and mobile viewport sizes; synthetic touch events do not replace real-device QA.
+
+Run `node --test tests/session-tail-clearance.e2e.test.mjs` to check that the
+user-message-summary control stays below the last transcript row at the tail.
+This guards the reply's right edge from sliding under the summary button.
 
 The fixture renders the real SessionViewer with 3,000 synthetic tool calls and
 stubs detail requests. It checks bounded mounting, initial tail positioning,
@@ -35,6 +46,15 @@ or session is required. The fixture is not a production build entry point.
 `tests/lexical-ime/` in a system Chromium via `playwright-core` and replays the
 iFlytek-style empty-`compositionend` commit sequence over CDP. It guards the
 Lexical 0.46.0 upgrade (upstream facebook/lexical#8701): committed English text
+
+# Viewport rotation regression
+
+`node --test tests/viewport-metrics.test.mjs tests/viewport-rotation.e2e.test.mjs`
+checks that the visual-viewport offset is only consumed by the mobile fixed
+layout, and that an orientation change drops an offset measured in the previous
+layout before re-measuring. The Playwright case replays the offset lifecycle
+with a controllable visual viewport; physical-device Safari rotation still
+needs device QA.
 
 # Drawer inline edit viewport regression
 

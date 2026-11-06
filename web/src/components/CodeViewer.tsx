@@ -1,49 +1,10 @@
 import React, { memo, useEffect, useMemo, useRef } from "react";
-import Prism from "prismjs";
-import "prismjs/themes/prism.css";
+import {
+  highlightCodeToHtml,
+  languageForExtension,
+} from "./codeHighlight";
 
-// Import common languages
-import "prismjs/components/prism-javascript";
-import "prismjs/components/prism-typescript";
-import "prismjs/components/prism-jsx";
-import "prismjs/components/prism-tsx";
-import "prismjs/components/prism-go";
-import "prismjs/components/prism-python";
-import "prismjs/components/prism-java";
-import "prismjs/components/prism-c";
-import "prismjs/components/prism-cpp";
-import "prismjs/components/prism-csharp";
-import "prismjs/components/prism-rust";
-import "prismjs/components/prism-json";
-import "prismjs/components/prism-yaml";
-import "prismjs/components/prism-bash";
-import "prismjs/components/prism-sql";
-import "prismjs/components/prism-css";
-
-const languageByExt: Record<string, string> = {
-  ".js": "javascript",
-  ".jsx": "jsx",
-  ".ts": "typescript",
-  ".tsx": "tsx",
-  ".go": "go",
-  ".py": "python",
-  ".java": "java",
-  ".c": "c",
-  ".cpp": "cpp",
-  ".cs": "csharp",
-  ".rs": "rust",
-  ".json": "json",
-  ".yaml": "yaml",
-  ".yml": "yaml",
-  ".html": "markup",
-  ".css": "css",
-  ".md": "markdown",
-};
-
-export function supportsLineSelection(ext?: string): boolean {
-  if (!ext) return false;
-  return Object.prototype.hasOwnProperty.call(languageByExt, ext.toLowerCase());
-}
+export { supportsLineSelection } from "./codeHighlight";
 
 export const CodeViewer = memo(function CodeViewer({
   content,
@@ -57,16 +18,16 @@ export const CodeViewer = memo(function CodeViewer({
   targetColumn?: number;
   contentRef?: React.RefObject<HTMLElement | null>;
 }) {
-  const language = languageByExt[ext ?? ""] ?? "markup";
+  const language = languageForExtension(ext);
   const lineRefs = useRef<Array<HTMLDivElement | null>>([]);
-  
+
   // 计算行数
   const lines = useMemo(() => content.split("\n"), [content]);
-  
-  const html = useMemo(() => {
-    const grammar = Prism.languages[language] ?? Prism.languages.markup;
-    return Prism.highlight(content, grammar, language);
-  }, [content, language]);
+
+  const html = useMemo(
+    () => highlightCodeToHtml(content, language),
+    [content, language],
+  );
 
   useEffect(() => {
     if (!targetLine || targetLine < 1) return;

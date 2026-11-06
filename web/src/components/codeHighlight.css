@@ -1,0 +1,121 @@
+:root {
+  --code-token-comment: #64748b;
+  --code-token-keyword: #7c3aed;
+  --code-token-string: #16703a;
+  --code-token-number: #b45309;
+  --code-token-type: #0e7490;
+  --code-token-function: #1d4ed8;
+  --code-token-property: #9d174d;
+  --code-token-punctuation: var(--text-secondary);
+  --code-token-invalid: #dc2626;
+}
+
+:root[data-theme="dark"] {
+  --code-token-comment: #94a3b8;
+  --code-token-keyword: #c4b5fd;
+  --code-token-string: #86efac;
+  --code-token-number: #fcd34d;
+  --code-token-type: #67e8f9;
+  --code-token-function: #93c5fd;
+  --code-token-property: #f9a8d4;
+  --code-token-punctuation: var(--text-secondary);
+  --code-token-invalid: #fca5a5;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme]) {
+    --code-token-comment: #94a3b8;
+    --code-token-keyword: #c4b5fd;
+    --code-token-string: #86efac;
+    --code-token-number: #fcd34d;
+    --code-token-type: #67e8f9;
+    --code-token-function: #93c5fd;
+    --code-token-property: #f9a8d4;
+    --code-token-punctuation: var(--text-secondary);
+    --code-token-invalid: #fca5a5;
+  }
+}
+
+.token.comment,
+.token.prolog,
+.token.doctype,
+.token.cdata {
+  color: var(--code-token-comment);
+}
+
+.token.punctuation {
+  color: var(--code-token-punctuation);
+}
+
+.token.namespace {
+  opacity: 0.7;
+}
+
+.token.property,
+.token.attr-name {
+  color: var(--code-token-property);
+}
+
+.token.tag,
+.token.class-name,
+.token.builtin {
+  color: var(--code-token-type);
+}
+
+.token.number,
+.token.boolean,
+.token.constant,
+.token.symbol {
+  color: var(--code-token-number);
+}
+
+.token.deleted,
+.token.invalid {
+  color: var(--code-token-invalid);
+}
+
+.token.string,
+.token.char,
+.token.attr-value,
+.token.inserted {
+  color: var(--code-token-string);
+}
+
+.token.selector,
+.token.function {
+  color: var(--code-token-function);
+}
+
+.token.operator,
+.token.entity,
+.token.url {
+  color: var(--code-token-punctuation);
+  background: transparent;
+}
+
+.token.atrule,
+.token.keyword,
+.token.important {
+  color: var(--code-token-keyword);
+}
+
+.token.regex {
+  color: var(--code-token-string);
+}
+
+.token.variable {
+  color: var(--code-token-property);
+}
+
+.token.important,
+.token.bold {
+  font-weight: 700;
+}
+
+.token.italic {
+  font-style: italic;
+}
+
+.token.entity {
+  cursor: help;
+}
