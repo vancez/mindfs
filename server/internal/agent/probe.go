@@ -9,7 +9,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -259,11 +258,10 @@ func (s *probeSessionStore) saveLocked() error {
 // Start 启动定期探测
 func (p *Prober) Start(ctx context.Context) {
 	// 首次全量探测放到后台，避免阻塞服务启动和请求处理。
-	// Windows 下深度探测会启动外部 Agent CLI；部分 SDK/CLI 无法由 MindFS
-	// 注入 CREATE_NO_WINDOW，后台启动时会出现空白控制台窗口。
-	if shouldRunBackgroundRuntimeProbe(runtime.GOOS) {
-		go p.safeProbeAll(ctx)
-	}
+	// ACP runtime 与 claude/codex SDK 启动 Agent CLI 时均已隐藏控制台窗口
+	// （CREATE_NO_WINDOW），因此 Windows 也可以执行后台深度探测；否则已安装
+	// Agent 会一直停留在 "probe pending" 状态，直到手动重启。
+	go p.safeProbeAll(ctx)
 
 	// 启动定期探测：只重试未安装命令。运行时失败不做主动恢复探测，
 	// 避免周期性打开 agent probe session。
@@ -317,13 +315,9 @@ func (p *Prober) UpdateConfig(ctx context.Context, cfg *Config) {
 		}
 	}
 	p.mu.Unlock()
-	if len(installed) > 0 && shouldRunBackgroundRuntimeProbe(runtime.GOOS) {
+	if len(installed) > 0 {
 		go p.probeInstalledAgents(ctx, installed)
 	}
-}
-
-func shouldRunBackgroundRuntimeProbe(goos string) bool {
-	return goos != "windows"
 }
 
 // ProbeAll 探测所有配置的 Agent
@@ -791,7 +785,6 @@ func probeInstallStatus(name string, def Definition, ts time.Time) Status {
 		return status
 	}
 	status.Installed = true
-	status.ProbeError = "probe pending"
 	return status
 }
 
@@ -1046,7 +1039,7 @@ func (p *Prober) probeInstalledAgents(ctx context.Context, defs []Definition) {
 	}
 
 	p.runDefinitionsConcurrently(defs, func(_ int, def Definition) {
-		status := unavailableStatus(def.Name, true, "probe pending", time.Now().UTC())
+		status := unavailableStatus(def.Name, true, "", time.Now().UTC())
 		status.Protocol = agentDefinitionProtocol(def.Name, def)
 		status = safeProbeInstalledAgentWithPool(ctx, def.Name, def, p.pool, p.probeSessions, status, probePhaseBackground)
 		p.setStatus(status)

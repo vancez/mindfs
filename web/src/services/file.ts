@@ -1,5 +1,13 @@
 import { appURL } from "./base";
 import { e2eeService } from "./e2ee";
+import { buildStreamMetadataProof } from "./e2eeProof";
+import {
+  decryptResponseToBlob,
+  E2EE_STREAM_MARKER_DOWNLOAD,
+  E2EE_STREAM_MARKER_HEADER,
+  E2EE_STREAM_META_HEADER,
+  E2EE_STREAM_PURPOSE_DOWNLOAD,
+} from "./e2eeStream";
 
 export type ReadMode = "full" | "incremental";
 
@@ -569,12 +577,12 @@ export async function fetchFile(params: FetchFileParams): Promise<FilePayload | 
 
   try {
     const requestURL = buildFileURL(params.rootId, params.path, readMode, cursor, validationMTime || undefined);
-    const headers = e2eeService.isRequired()
-      ? await e2eeService.fileProofHeaders("GET", requestURL)
-      : undefined;
+    const proof = e2eeService.isRequired()
+      ? await e2eeService.fileProofContext("GET", requestURL)
+      : null;
     const response = await fetchResponse(
       requestURL,
-      { ...request.init, headers },
+      { ...request.init, headers: proof?.headers },
     );
 
     if (response.status === 304) {
@@ -587,19 +595,23 @@ export async function fetchFile(params: FetchFileParams): Promise<FilePayload | 
         return record!.file;
       }
       const retryURL = buildFileURL(params.rootId, params.path, readMode, cursor);
+      const retryProof = e2eeService.isRequired()
+        ? await e2eeService.fileProofContext("GET", retryURL)
+        : null;
       const retry = await fetchResponse(
         retryURL,
         {
           ...request.init,
-          headers: e2eeService.isRequired()
-            ? await e2eeService.fileProofHeaders("GET", retryURL)
-            : headers,
+          headers: retryProof?.headers,
         },
       );
       if (!retry.ok) {
         throw new Error(`open file failed after 304 retry: status=${retry.status}`);
       }
-      const retryPayload = await e2eeService.parseProtectedJSONResponse<FileResponse>(retry);
+      const retryPayload = await e2eeService.parseProtectedJSONResponse<FileResponse>(
+        retry,
+        retryProof ? { context: retryProof.context } : undefined,
+      );
       const retryFile = await unwrapFileResponse(retryPayload);
       if (!retryFile) {
         return null;
@@ -618,7 +630,10 @@ export async function fetchFile(params: FetchFileParams): Promise<FilePayload | 
       throw new Error(`open file failed: status=${response.status}`);
     }
 
-    const payload = await e2eeService.parseProtectedJSONResponse<FileResponse>(response);
+    const payload = await e2eeService.parseProtectedJSONResponse<FileResponse>(
+      response,
+      proof ? { context: proof.context } : undefined,
+    );
     const file = await unwrapFileResponse(payload);
     if (!file) {
       return null;
@@ -652,10 +667,14 @@ export async function fetchProofProtectedBlob(params: {
     const rawURL = withRawFlag(
       baseURL,
     );
-    const headers = e2eeService.isRequired()
-      ? await e2eeService.fileProofHeaders("GET", rawURL)
-      : undefined;
-    const response = await fetchResponse(rawURL, { ...request.init, headers });
+    const proof = e2eeService.isRequired()
+      ? await e2eeService.fileProofContext("GET", rawURL)
+      : null;
+    const response = await fetchResponse(rawURL, {
+      ...request.init,
+      headers: proof?.headers,
+      cache: "no-store",
+    });
     if (!response.ok) {
       if (response.status === 404) {
         rawFileFailures.set(cacheKey, Date.now());
@@ -669,7 +688,37 @@ export async function fetchProofProtectedBlob(params: {
       throw new Error(`open raw file failed: status=${response.status}`);
     }
     rawFileFailures.delete(cacheKey);
-    return response.blob();
+    if (!proof) {
+      if (response.headers.get(E2EE_STREAM_MARKER_HEADER)) {
+        throw new Error("e2ee_required");
+      }
+      return response.blob();
+    }
+    if (response.headers.get(E2EE_STREAM_MARKER_HEADER) !== E2EE_STREAM_MARKER_DOWNLOAD) {
+      throw new Error("e2ee_stream_missing");
+    }
+    const contentType = response.headers.get("Content-Type") || "";
+    const contentLength = response.headers.get("Content-Length") || "";
+    const contentDisposition = response.headers.get("Content-Disposition") || "";
+    const metadata = response.headers.get(E2EE_STREAM_META_HEADER) || "";
+    if (!metadata) {
+      throw new Error("e2ee_metadata_missing");
+    }
+    const expectedMetadata = await buildStreamMetadataProof(
+      proof.keyBytes,
+      proof.context.method,
+      proof.context.path,
+      proof.context.nonce,
+      contentType,
+      contentLength,
+      contentDisposition,
+      E2EE_STREAM_MARKER_DOWNLOAD,
+    );
+    if (expectedMetadata !== metadata) {
+      throw new Error("e2ee_metadata_invalid");
+    }
+    const mimeType = contentType || "application/octet-stream";
+    return decryptResponseToBlob(response, proof.key, E2EE_STREAM_PURPOSE_DOWNLOAD, proof.nonce, mimeType);
   } finally {
     if (request.timer !== null) {
       window.clearTimeout(request.timer);

@@ -36,6 +36,7 @@ import (
 	"mindfs/server/internal/preferences"
 	"mindfs/server/internal/relay"
 	"mindfs/server/internal/session"
+	"mindfs/server/internal/svnview"
 
 	"github.com/go-chi/chi/v5"
 )
@@ -56,6 +57,18 @@ type protectedResponseWriter struct {
 	body   bytes.Buffer
 }
 
+type streamRequestBody struct {
+	io.Reader
+	closer io.Closer
+}
+
+func (b *streamRequestBody) Close() error {
+	if b == nil || b.closer == nil {
+		return nil
+	}
+	return b.closer.Close()
+}
+
 const (
 	maxJSONRequestBytes   = 64 << 20
 	uploadMemoryBytes     = 8 << 20
@@ -68,6 +81,11 @@ const (
 	clientIDHeaderName    = "X-MindFS-Client-ID"
 	e2eeProofHeaderName   = "X-MindFS-Proof"
 	e2eeTSHeaderName      = "X-MindFS-TS"
+	e2eeNonceHeaderName   = "X-MindFS-Nonce"
+	e2eeStreamHeaderName  = "X-MindFS-E2EE-Stream"
+	e2eeMetaHeaderName    = "X-MindFS-E2EE-Meta"
+	e2eeStreamUpload      = "upload"
+	e2eeStreamDownload    = "download"
 	localCLIHeaderName    = "X-MindFS-Local-CLI-Token"
 	requestProofMaxSkew   = 5 * time.Minute
 	pairingInterval       = 3 * time.Second
@@ -100,34 +118,41 @@ func (h *HTTPHandler) requireProtectedHTTPSession(r *http.Request) (*e2ee.Sessio
 	return sess, true, nil
 }
 
-func (h *HTTPHandler) requireRequestProof(r *http.Request) (*e2ee.Session, error) {
+func (h *HTTPHandler) requireRequestProof(r *http.Request) (*e2ee.Session, string, error) {
 	manager := h.AppContext.GetE2EEManager()
 	if manager == nil || !manager.Enabled() {
-		return nil, nil
+		return nil, "", nil
 	}
 	clientID := strings.TrimSpace(r.Header.Get(clientIDHeaderName))
 	ts := strings.TrimSpace(r.Header.Get(e2eeTSHeaderName))
 	proof := strings.TrimSpace(r.Header.Get(e2eeProofHeaderName))
+	nonce := strings.TrimSpace(r.Header.Get(e2eeNonceHeaderName))
 	if clientID == "" || ts == "" || proof == "" {
-		return nil, errInvalidRequest("e2ee_proof_required")
+		return nil, "", errInvalidRequest("e2ee_proof_required")
+	}
+	if !e2ee.ValidRequestNonce(nonce) {
+		return nil, "", errInvalidRequest("e2ee_nonce_required")
 	}
 	sess, err := manager.SessionForClient(clientID)
 	if err != nil {
-		return nil, errInvalidRequest(err.Error())
+		return nil, "", errInvalidRequest(err.Error())
 	}
 	timestamp, err := time.Parse(time.RFC3339, ts)
 	if err != nil {
-		return nil, errInvalidRequest("invalid_e2ee_ts")
+		return nil, "", errInvalidRequest("invalid_e2ee_ts")
 	}
 	now := time.Now().UTC()
 	if timestamp.Before(now.Add(-requestProofMaxSkew)) || timestamp.After(now.Add(requestProofMaxSkew)) {
-		return nil, errInvalidRequest("e2ee_proof_expired")
+		return nil, "", errInvalidRequest("e2ee_proof_expired")
 	}
-	expected := e2ee.BuildRequestProof(sess.Key, r.Method, requestProofPath(r), ts, clientID)
+	expected := e2ee.BuildRequestProof(sess.Key, r.Method, requestProofPath(r), ts, nonce, clientID)
 	if !e2ee.VerifyProof(expected, proof) {
-		return nil, errInvalidRequest("e2ee_proof_invalid")
+		return nil, "", errInvalidRequest("e2ee_proof_invalid")
 	}
-	return sess, nil
+	if !manager.ConsumeRequestNonce(sess.ID, nonce) {
+		return nil, "", errInvalidRequest("e2ee_proof_replayed")
+	}
+	return sess, nonce, nil
 }
 
 func requestProofPath(r *http.Request) string {
@@ -141,8 +166,8 @@ func requestProofPath(r *http.Request) string {
 	return path + "?" + r.URL.RawQuery
 }
 
-func writeProtectedJSON(w http.ResponseWriter, status int, key []byte, value any) error {
-	envelope, err := e2ee.EncryptJSON(key, value)
+func writeProtectedJSON(w http.ResponseWriter, status int, key, aad []byte, value any) error {
+	envelope, err := e2ee.EncryptJSONWithAAD(key, aad, value)
 	if err != nil {
 		return err
 	}
@@ -182,18 +207,19 @@ func (h *HTTPHandler) protectedEndpoint(next http.HandlerFunc) http.HandlerFunc 
 			respondError(w, http.StatusUnauthorized, err)
 			return
 		}
-		sess, err = h.requireRequestProof(r)
+		sess, requestNonce, err := h.requireRequestProof(r)
 		if err != nil {
 			respondError(w, http.StatusUnauthorized, err)
 			return
 		}
+		proofPath := requestProofPath(r)
 		if r.Body != nil && r.ContentLength != 0 && r.Method != http.MethodGet && r.Method != http.MethodHead {
 			var envelope e2ee.CipherEnvelope
 			if err := json.NewDecoder(io.LimitReader(r.Body, maxJSONRequestBytes)).Decode(&envelope); err != nil {
 				respondError(w, http.StatusBadRequest, errInvalidRequest("invalid protected payload"))
 				return
 			}
-			plaintext, err := e2ee.DecryptBytes(sess.Key, &envelope)
+			plaintext, err := e2ee.DecryptBytesWithAAD(sess.Key, e2ee.RequestEnvelopeAAD(r.Method, proofPath, requestNonce), &envelope)
 			if err != nil {
 				respondError(w, http.StatusBadRequest, errInvalidRequest("e2ee_proof_invalid"))
 				return
@@ -215,7 +241,7 @@ func (h *HTTPHandler) protectedEndpoint(next http.HandlerFunc) http.HandlerFunc 
 			respondError(w, http.StatusServiceUnavailable, err)
 			return
 		}
-		if err := writeProtectedJSON(w, recorder.status, sess.Key, payload); err != nil {
+		if err := writeProtectedJSON(w, recorder.status, sess.Key, e2ee.ResponseEnvelopeAAD(r.Method, proofPath, requestNonce), payload); err != nil {
 			respondError(w, http.StatusServiceUnavailable, err)
 			return
 		}
@@ -331,6 +357,13 @@ func (h *HTTPHandler) Routes() http.Handler {
 	r.Post("/api/git/discard", h.protectedEndpoint(h.handleGitDiscard))
 	r.Post("/api/git/worktrees", h.protectedEndpoint(h.handleGitWorktreeCreate))
 	r.Delete("/api/git/worktrees", h.protectedEndpoint(h.handleGitWorktreeRemove))
+	r.Get("/api/svn/status", h.protectedEndpoint(h.handleSvnStatus))
+	r.Get("/api/svn/diff", h.protectedEndpoint(h.handleSvnDiff))
+	r.Get("/api/svn/related-file/diff", h.protectedEndpoint(h.handleSvnRelatedFileDiff))
+	r.Post("/api/svn/update", h.protectedEndpoint(h.handleSvnUpdate))
+	r.Post("/api/svn/commit", h.protectedEndpoint(h.handleSvnCommit))
+	r.Post("/api/svn/revert", h.protectedEndpoint(h.handleSvnRevert))
+	r.Post("/api/svn/resolve", h.protectedEndpoint(h.handleSvnResolve))
 	r.Post("/api/upload", h.handleUpload)
 	r.Get("/api/candidates", h.protectedEndpoint(h.handleCandidates))
 	r.Post("/api/prompts", h.protectedEndpoint(h.handlePromptSave))
@@ -1072,9 +1105,17 @@ func (h *HTTPHandler) handleSessionFork(w http.ResponseWriter, r *http.Request) 
 			},
 		})
 	}
+	// The fork response is cached by the client as the session's initial state,
+	// so it must carry the copied exchange aux (thoughts and tool calls) or the
+	// transcript renders only user/agent text until the next server sync.
+	exchangeAux, _ := h.service().GetSessionExchangeAux(r.Context(), usecase.GetSessionExchangeAuxInput{
+		RootID: req.RootID,
+		Key:    out.Session.Key,
+		Seq:    0,
+	})
 	respondJSON(w, http.StatusOK, map[string]any{
 		"session_key": out.Session.Key,
-		"session":     h.sessionResponse(out.Session, nil, agenttypes.ContextWindow{}, nil),
+		"session":     h.sessionResponse(out.Session, nil, agenttypes.ContextWindow{}, exchangeAux),
 	})
 }
 
@@ -1188,13 +1229,29 @@ func (h *HTTPHandler) handleSessionDelete(w http.ResponseWriter, r *http.Request
 		return
 	}
 	uc := h.service()
-	if err := uc.DeleteSession(r.Context(), usecase.DeleteSessionInput{
+	keepChildren := r.URL.Query().Get("keep_children") == "1"
+	keys, err := uc.DeleteSession(r.Context(), usecase.DeleteSessionInput{
 		RootID:       rootID,
 		Key:          key,
-		KeepChildren: r.URL.Query().Get("keep_children") == "1",
-	}); err != nil {
+		KeepChildren: keepChildren,
+	})
+	if err != nil {
 		respondError(w, http.StatusNotFound, err)
 		return
+	}
+	if h.AppContext != nil {
+		// Other browsers cannot see an HTTP response from this client. Broadcast
+		// the authoritative list of removed keys so their session lists, open
+		// views and reply indicators drop the deleted sessions.
+		h.AppContext.GetSessionStreamHub().BroadcastAll(WSResponse{
+			Type: "session.deleted",
+			Payload: map[string]any{
+				"root_id":       rootID,
+				"session_key":   key,
+				"keys":          keys,
+				"keep_children": keepChildren,
+			},
+		})
 	}
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -1255,6 +1312,7 @@ func (h *HTTPHandler) sessionListResponse(s *session.Session) map[string]any {
 	return map[string]any{
 		"key":                 s.Key,
 		"type":                s.Type,
+		"pending":             h.sessionPending(s),
 		"parent_session_key":  s.ParentSessionKey,
 		"parent_tool_call_id": s.ParentToolCallID,
 		"source":              s.Source,
@@ -1273,6 +1331,13 @@ func (h *HTTPHandler) sessionListResponse(s *session.Session) map[string]any {
 		"updated_at":          s.UpdatedAt,
 		"closed_at":           s.ClosedAt,
 	}
+}
+
+func (h *HTTPHandler) sessionPending(s *session.Session) bool {
+	if h == nil || h.AppContext == nil || s == nil {
+		return false
+	}
+	return h.AppContext.GetSessionStreamHub().SessionPending(s.Key)
 }
 
 func (h *HTTPHandler) configuredShells() []commandexec.ShellSpec {
@@ -1863,7 +1928,7 @@ func (h *HTTPHandler) handleFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	raw := r.URL.Query().Get("raw")
-	proofSession, err := h.requireRequestProof(r)
+	proofSession, requestNonce, err := h.requireRequestProof(r)
 	if err != nil {
 		respondError(w, http.StatusUnauthorized, err)
 		return
@@ -1883,13 +1948,50 @@ func (h *HTTPHandler) handleFile(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		defer rawOut.File.Close()
-		w.Header().Set("Content-Length", strconv.FormatInt(rawOut.Info.Size(), 10))
-		ext := filepath.Ext(rawOut.RelPath)
-		if mimeType := mime.TypeByExtension(ext); mimeType != "" {
-			w.Header().Set("Content-Type", mimeType)
-		} else {
-			w.Header().Set("Content-Type", "application/octet-stream")
+		mimeType := mime.TypeByExtension(filepath.Ext(rawOut.RelPath))
+		if mimeType == "" {
+			mimeType = "application/octet-stream"
 		}
+		if proofSession != nil {
+			stream, err := e2ee.NewStreamWriter(w, proofSession.Key, e2ee.StreamPurposeDownload, requestNonce)
+			if err != nil {
+				respondError(w, http.StatusServiceUnavailable, err)
+				return
+			}
+			contentLength := strconv.FormatInt(e2ee.EncryptedStreamLength(rawOut.Info.Size()), 10)
+			contentDisposition := ""
+			if r.URL.Query().Get("download") == "1" {
+				contentDisposition = fmt.Sprintf("attachment; filename=%q", filepath.Base(rawOut.RelPath))
+			}
+			w.Header().Set("Content-Type", mimeType)
+			w.Header().Set(e2eeStreamHeaderName, e2eeStreamDownload)
+			w.Header().Set(e2eeMetaHeaderName, e2ee.BuildStreamMetadataProof(
+				proofSession.Key,
+				r.Method,
+				requestProofPath(r),
+				requestNonce,
+				mimeType,
+				contentLength,
+				contentDisposition,
+				e2eeStreamDownload,
+			))
+			w.Header().Set("Cache-Control", "no-store")
+			w.Header().Set("Content-Length", contentLength)
+			if contentDisposition != "" {
+				w.Header().Set("Content-Disposition", contentDisposition)
+			}
+			w.WriteHeader(http.StatusOK)
+			if _, err := io.Copy(stream, rawOut.File); err != nil {
+				log.Printf("[http] raw stream copy failed root=%s path=%s err=%v", rootID, path, err)
+				return
+			}
+			if err := stream.Close(); err != nil {
+				log.Printf("[http] raw stream close failed root=%s path=%s err=%v", rootID, path, err)
+			}
+			return
+		}
+		w.Header().Set("Content-Length", strconv.FormatInt(rawOut.Info.Size(), 10))
+		w.Header().Set("Content-Type", mimeType)
 		if r.URL.Query().Get("download") == "1" {
 			w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", filepath.Base(rawOut.RelPath)))
 		}
@@ -1934,7 +2036,7 @@ func (h *HTTPHandler) handleFile(w http.ResponseWriter, r *http.Request) {
 		"file": out.File,
 	}
 	if proofSession != nil {
-		if err := writeProtectedJSON(w, http.StatusOK, proofSession.Key, payload); err != nil {
+		if err := writeProtectedJSON(w, http.StatusOK, proofSession.Key, e2ee.ResponseEnvelopeAAD(r.Method, requestProofPath(r), requestNonce), payload); err != nil {
 			respondError(w, http.StatusServiceUnavailable, err)
 		}
 		return
@@ -2330,19 +2432,49 @@ func (h *HTTPHandler) handleUpload(w http.ResponseWriter, r *http.Request) {
 		respondError(w, http.StatusBadRequest, errInvalidRequest("root required"))
 		return
 	}
-	proofSession, err := h.requireRequestProof(r)
+	proofSession, requestNonce, err := h.requireRequestProof(r)
 	if err != nil {
 		respondError(w, http.StatusUnauthorized, err)
 		return
 	}
+	var streamReader *e2ee.StreamReader
+	if proofSession != nil {
+		if strings.TrimSpace(r.Header.Get(e2eeStreamHeaderName)) != e2eeStreamUpload {
+			respondError(w, http.StatusBadRequest, errInvalidRequest("e2ee_stream_required"))
+			return
+		}
+		reader, err := e2ee.NewStreamReader(r.Body, proofSession.Key, e2ee.StreamPurposeUpload, requestNonce)
+		if err != nil {
+			respondError(w, http.StatusBadRequest, errInvalidRequest("e2ee_stream_invalid"))
+			return
+		}
+		streamReader = reader
+		originalBody := r.Body
+		r.Body = &streamRequestBody{Reader: reader, closer: originalBody}
+		r.ContentLength = -1
+	}
 	// Bound memory use, not file size: larger files spill to temporary disk storage.
 	if err := r.ParseMultipartForm(uploadMemoryBytes); err != nil {
+		if r.MultipartForm != nil {
+			r.MultipartForm.RemoveAll()
+		}
+		if streamReader != nil {
+			respondError(w, http.StatusBadRequest, errInvalidRequest("e2ee_stream_invalid"))
+			return
+		}
 		respondError(w, http.StatusBadRequest, errInvalidRequest("invalid multipart form"))
 		return
 	}
 	if r.MultipartForm == nil {
 		respondError(w, http.StatusBadRequest, errInvalidRequest("files required"))
 		return
+	}
+	if streamReader != nil {
+		if err := streamReader.Finish(); err != nil {
+			r.MultipartForm.RemoveAll()
+			respondError(w, http.StatusBadRequest, errInvalidRequest("e2ee_stream_invalid"))
+			return
+		}
 	}
 	defer r.MultipartForm.RemoveAll()
 	fileHeaders := r.MultipartForm.File["files"]
@@ -2379,7 +2511,7 @@ func (h *HTTPHandler) handleUpload(w http.ResponseWriter, r *http.Request) {
 		"files": out.Files,
 	}
 	if proofSession != nil {
-		if err := writeProtectedJSON(w, http.StatusOK, proofSession.Key, payload); err != nil {
+		if err := writeProtectedJSON(w, http.StatusOK, proofSession.Key, e2ee.ResponseEnvelopeAAD(r.Method, requestProofPath(r), requestNonce), payload); err != nil {
 			respondError(w, http.StatusServiceUnavailable, err)
 		}
 		return
@@ -2580,7 +2712,7 @@ func (h *HTTPHandler) handleRelayStatus(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	sess, err := h.relayStatusSession(r)
+	sess, requestNonce, err := h.relayStatusSession(r)
 	if err != nil {
 		respondError(w, http.StatusUnauthorized, err)
 		return
@@ -2589,28 +2721,28 @@ func (h *HTTPHandler) handleRelayStatus(w http.ResponseWriter, r *http.Request) 
 		respondJSON(w, http.StatusOK, publicRelayStatus(status))
 		return
 	}
-	if err := writeProtectedJSON(w, http.StatusOK, sess.Key, status); err != nil {
+	if err := writeProtectedJSON(w, http.StatusOK, sess.Key, e2ee.ResponseEnvelopeAAD(r.Method, requestProofPath(r), requestNonce), status); err != nil {
 		respondError(w, http.StatusServiceUnavailable, err)
 		return
 	}
 }
 
-func (h *HTTPHandler) relayStatusSession(r *http.Request) (*e2ee.Session, error) {
+func (h *HTTPHandler) relayStatusSession(r *http.Request) (*e2ee.Session, string, error) {
 	if strings.TrimSpace(r.Header.Get(e2eeHeaderName)) == "" {
-		return nil, nil
+		return nil, "", nil
 	}
 	sess, protected, err := h.requireProtectedHTTPSession(r)
 	if !protected {
-		return nil, nil
+		return nil, "", nil
 	}
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
-	sess, err = h.requireRequestProof(r)
+	sess, requestNonce, err := h.requireRequestProof(r)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
-	return sess, nil
+	return sess, requestNonce, nil
 }
 
 func (h *HTTPHandler) handleRelayBindStart(w http.ResponseWriter, _ *http.Request) {
@@ -2783,12 +2915,26 @@ func managedDirResponse(dir fs.RootInfo) map[string]any {
 		resp["size"] = info.Size()
 		resp["mtime"] = info.ModTime().UTC().Format(time.RFC3339Nano)
 	}
-	if ok, err := gitview.HasRepo(context.Background(), dir.RootPath); err == nil {
-		resp["is_git_repo"] = ok
+	isGitRepo := false
+	if hasGitMetadataAncestor(dir.RootPath) {
+		if ok, err := gitview.HasRepo(context.Background(), dir.RootPath); err == nil {
+			isGitRepo = ok
+			resp["is_git_repo"] = ok
+		}
+		if ok, err := gitview.IsWorktree(dir.RootPath); err == nil {
+			resp["is_git_worktree"] = ok
+		}
+	} else {
+		resp["is_git_repo"] = false
+		resp["is_git_worktree"] = false
 	}
-	if ok, err := gitview.IsWorktree(dir.RootPath); err == nil {
-		resp["is_git_worktree"] = ok
+	isSvnRepo := false
+	if !isGitRepo {
+		if _, ok := svnview.DetectWorkingCopy(context.Background(), dir.RootPath); ok {
+			isSvnRepo = true
+		}
 	}
+	resp["is_svn_repo"] = isSvnRepo
 	return resp
 }
 

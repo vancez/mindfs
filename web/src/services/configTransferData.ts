@@ -37,7 +37,7 @@ export function categoryDescription(id: ConfigCategory): MessageKey { return `co
 // Only explicit preference keys may cross devices. Never copy arbitrary storage
 // prefixes: they also contain pairing secrets, access tokens and plugin grants.
 export const CONFIG_BROWSER_KEYS: Partial<Record<ConfigCategory, readonly string[]>> = {
-  appearance: ["mindfs-locale", "mindfs-appearance-mode", "mindfs-font-size-preferences", "mindfs-sidebars-swapped", "mindfs-default-main-content-view", "mindfs-tree-sort-mode", "mindfs-git-diff-side-by-side", "mindfs-markdown-outline-enabled", "mindfs-project-tree-tab"],
+  appearance: ["mindfs-locale", "mindfs-appearance-mode", "mindfs-font-size-preferences", "mindfs-sidebars-swapped", "mindfs-default-main-content-view", "mindfs-tree-sort-mode", "mindfs-git-diff-side-by-side", "mindfs-markdown-outline-enabled", "mindfs-project-tree-tab", "mindfs-sidebar-footer-hidden"],
   interaction: ["mindfs-send-shortcut", "mindfs-mobile-enter-key-sends", "mindfs-float-ball-gestures", "mindfs-multi-project-session-list", "mindfs-mobile-reply-info"],
   prompts: ["mindfs-handoff-template"],
   nodes: ["mindfs_launcher_nodes"],
@@ -56,9 +56,9 @@ const enumKeys: Record<string, readonly string[]> = {
   "mindfs-appearance-mode": ["dark", "light", "meadow", "moss", "system"],
   "mindfs-default-main-content-view": ["task-kanban", "file-browser"],
   "mindfs-tree-sort-mode": ["name-asc", "name-desc", "mtime-desc", "mtime-asc", "size-desc", "size-asc"],
-  "mindfs-project-tree-tab": ["files", "git", "worktrees", "related"],
+  "mindfs-project-tree-tab": ["files", "git", "svn", "worktrees", "related"],
 };
-const booleanKeys = new Set(["mindfs-sidebars-swapped", "mindfs-git-diff-side-by-side", "mindfs-markdown-outline-enabled", "mindfs-mobile-enter-key-sends", "mindfs-multi-project-session-list"]);
+const booleanKeys = new Set(["mindfs-sidebars-swapped", "mindfs-git-diff-side-by-side", "mindfs-markdown-outline-enabled", "mindfs-mobile-enter-key-sends", "mindfs-multi-project-session-list", "mindfs-sidebar-footer-hidden"]);
 
 export function validateBrowserValue(key: string, raw: unknown): asserts raw is string | null {
   if (raw === null) return;

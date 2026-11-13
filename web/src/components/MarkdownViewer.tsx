@@ -5,28 +5,18 @@ import remarkMath from "remark-math";
 import rehypeKatex from "rehype-katex";
 import rehypeRaw from "rehype-raw";
 import rehypeSanitize, { defaultSchema } from "rehype-sanitize";
-import Prism from "prismjs";
 import { copyText } from "../services/clipboard";
 import { fetchProofProtectedBlob } from "../services/file";
 import { openExternalURL } from "../services/platformNavigation";
 import { useI18n } from "../i18n";
 import { buildDiffCodeRows, type DiffCodeRow } from "./gitDiffModel";
 import { extractMarkdownOutline } from "./markdownOutline";
+import { remarkTrimQuotedAutolinks } from "./markdownAutolinks";
 
 const EMPTY_OUTLINE: ReturnType<typeof extractMarkdownOutline> = [];
 import { DiagramPreview } from "./DiagramPreview";
-import "prismjs/themes/prism.css";
+import { highlightCodeToHtml } from "./codeHighlight";
 import "katex/dist/katex.min.css";
-// Reuse the language imports from global Prism context (since they are imported in CodeViewer, they might be available if loaded, 
-// but strictly speaking we should import them here or centralize. For simplicity, we rely on the side-effects of CodeViewer imports 
-// if both are used, or we re-import essential ones here to be safe)
-import "prismjs/components/prism-javascript";
-import "prismjs/components/prism-typescript";
-import "prismjs/components/prism-jsx";
-import "prismjs/components/prism-tsx";
-import "prismjs/components/prism-bash";
-import "prismjs/components/prism-json";
-import "prismjs/components/prism-diff";
 
 const monoFontFamily = [
   '"SFMono-Regular"',
@@ -280,12 +270,7 @@ function MarkdownCodeBlock({
 
   const highlightedHtml = useMemo(() => {
     if (!language || language === "diff") return "";
-    const grammar = Prism.languages[language] ?? Prism.languages.markup;
-    try {
-      return Prism.highlight(rawContent, grammar, language);
-    } catch {
-      return "";
-    }
+    return highlightCodeToHtml(rawContent, language);
   }, [language, rawContent]);
 
   const handleCopy = () => {
@@ -970,7 +955,7 @@ function MarkdownViewerInner({
   const renderedMarkdown = useMemo(() => (
     <ReactMarkdown
         // Single tildes denote ranges (21~22, 6~7); require ~~ for strikethrough.
-        remarkPlugins={[[remarkGfm, { singleTilde: false }], remarkMath]}
+        remarkPlugins={[[remarkGfm, { singleTilde: false }], remarkMath, remarkTrimQuotedAutolinks]}
         remarkRehypeOptions={{ allowDangerousHtml: true }}
         rehypePlugins={[rehypeRaw, [rehypeSanitize, markdownSanitizeSchema], rehypeKatex]}
         components={markdownComponents}
@@ -988,6 +973,11 @@ function MarkdownViewerInner({
         color: "var(--text-primary)",
         lineHeight: 1.75,
         fontSize: "15px",
+        // Long unbroken tokens (inline code identifiers, URLs, hashes) have no
+        // spaces to wrap at; without a break rule they run past the message
+        // column and get clipped at the phone's right edge.
+        overflowWrap: "anywhere",
+        wordBreak: "break-word",
       }}
     >
       {renderedMarkdown}

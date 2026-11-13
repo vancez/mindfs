@@ -66,7 +66,7 @@ export function ToastContainer(): React.ReactElement {
     <div
       style={{
         position: "fixed",
-        bottom: "24px",
+        bottom: "calc(24px + var(--mindfs-safe-area-bottom, 0px))",
         left: "50%",
         transform: "translateX(-50%)",
         display: "flex",

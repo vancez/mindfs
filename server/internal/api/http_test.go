@@ -10,6 +10,7 @@ import (
 
 	"mindfs/server/internal/e2ee"
 	"mindfs/server/internal/relay"
+	"mindfs/server/internal/session"
 )
 
 func TestPathForStaticAssetCleansURLPaths(t *testing.T) {
@@ -119,6 +120,22 @@ func TestServeFrontendIndexKeepsLocalAssetRefsForDevVersion(t *testing.T) {
 	}
 	if strings.Contains(body, "/mindfs-assets/") {
 		t.Fatalf("body should not contain relayed asset path for dev version: %s", body)
+	}
+}
+
+func TestSessionListResponseIncludesServerPendingState(t *testing.T) {
+	app := &AppContext{}
+	handler := &HTTPHandler{AppContext: app}
+	sess := &session.Session{Key: "sess-1", Type: session.TypeChat, Name: "child"}
+
+	app.GetSessionStreamHub().SetPendingReply("root", sess.Key, sess.Name)
+	if got := handler.sessionListResponse(sess)["pending"]; got != true {
+		t.Fatalf("pending = %v, want true", got)
+	}
+
+	app.GetSessionStreamHub().ClearSessionPending(sess.Key)
+	if got := handler.sessionListResponse(sess)["pending"]; got != false {
+		t.Fatalf("pending = %v, want false", got)
 	}
 }
 
@@ -237,7 +254,7 @@ func TestRelayStatusSessionAllowsPublicStatusWithoutE2EEHeader(t *testing.T) {
 	}}
 	req := httptest.NewRequest(http.MethodGet, "/api/relay/status", nil)
 
-	sess, err := handler.relayStatusSession(req)
+	sess, _, err := handler.relayStatusSession(req)
 	if err != nil {
 		t.Fatalf("relayStatusSession() error = %v", err)
 	}

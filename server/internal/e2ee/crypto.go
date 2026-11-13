@@ -64,11 +64,8 @@ func VerifyProof(expected, provided string) bool {
 	return hmac.Equal([]byte(expected), []byte(provided))
 }
 
-func BuildRequestProof(key []byte, method, path, ts, clientID string) string {
-	h := hmac.New(sha256.New, key)
-	sum := sha256.Sum256([]byte(joinParts("mindfs-request-proof", method, path, ts, clientID)))
-	_, _ = h.Write(sum[:])
-	return base64.StdEncoding.EncodeToString(h.Sum(nil))
+func BuildRequestProof(key []byte, method, path, ts, nonce, clientID string) string {
+	return buildTransportProof(key, "mindfs-request-proof", method, path, ts, nonce, clientID)
 }
 
 func DeriveKey(pairingSecret, nodeID, clientEphPK, nodeEphPK, clientNonce, serverNonce string, localPriv *ecdh.PrivateKey, remotePub *ecdh.PublicKey) (DerivedKey, error) {
@@ -90,14 +87,22 @@ func DeriveKey(pairingSecret, nodeID, clientEphPK, nodeEphPK, clientNonce, serve
 }
 
 func EncryptJSON(key []byte, value any) (*CipherEnvelope, error) {
+	return EncryptJSONWithAAD(key, nil, value)
+}
+
+func EncryptJSONWithAAD(key, aad []byte, value any) (*CipherEnvelope, error) {
 	payload, err := json.Marshal(value)
 	if err != nil {
 		return nil, err
 	}
-	return EncryptBytes(key, payload)
+	return EncryptBytesWithAAD(key, aad, payload)
 }
 
 func EncryptBytes(key, plaintext []byte) (*CipherEnvelope, error) {
+	return EncryptBytesWithAAD(key, nil, plaintext)
+}
+
+func EncryptBytesWithAAD(key, aad, plaintext []byte) (*CipherEnvelope, error) {
 	block, err := aes.NewCipher(key)
 	if err != nil {
 		return nil, err
@@ -110,7 +115,7 @@ func EncryptBytes(key, plaintext []byte) (*CipherEnvelope, error) {
 	if _, err := rand.Read(nonce); err != nil {
 		return nil, err
 	}
-	ciphertext := aead.Seal(nil, nonce, plaintext, nil)
+	ciphertext := aead.Seal(nil, nonce, plaintext, aad)
 	return &CipherEnvelope{
 		Nonce:      base64.StdEncoding.EncodeToString(nonce),
 		Ciphertext: base64.StdEncoding.EncodeToString(ciphertext),
@@ -118,7 +123,11 @@ func EncryptBytes(key, plaintext []byte) (*CipherEnvelope, error) {
 }
 
 func DecryptJSON(key []byte, envelope *CipherEnvelope, out any) error {
-	plaintext, err := DecryptBytes(key, envelope)
+	return DecryptJSONWithAAD(key, nil, envelope, out)
+}
+
+func DecryptJSONWithAAD(key, aad []byte, envelope *CipherEnvelope, out any) error {
+	plaintext, err := DecryptBytesWithAAD(key, aad, envelope)
 	if err != nil {
 		return err
 	}
@@ -126,6 +135,10 @@ func DecryptJSON(key []byte, envelope *CipherEnvelope, out any) error {
 }
 
 func DecryptBytes(key []byte, envelope *CipherEnvelope) ([]byte, error) {
+	return DecryptBytesWithAAD(key, nil, envelope)
+}
+
+func DecryptBytesWithAAD(key, aad []byte, envelope *CipherEnvelope) ([]byte, error) {
 	if envelope == nil {
 		return nil, errors.New("cipher envelope required")
 	}
@@ -148,7 +161,7 @@ func DecryptBytes(key []byte, envelope *CipherEnvelope) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	return aead.Open(nil, nonce, ciphertext, nil)
+	return aead.Open(nil, nonce, ciphertext, aad)
 }
 
 func hkdfBytes(secret, salt, info []byte, length int) ([]byte, error) {

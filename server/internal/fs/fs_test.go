@@ -214,6 +214,20 @@ func TestRegistryRenameMovesHomeMetadataAndUpdatesIdentity(t *testing.T) {
 	}
 }
 
+func TestTryDecodeTextPreservesValidUTF8(t *testing.T) {
+	input := []byte("中文内容\n")
+	got, encoding, ok := TryDecodeText(input, ".lua")
+	if !ok {
+		t.Fatal("TryDecodeText returned false for valid UTF-8")
+	}
+	if encoding != "utf-8" {
+		t.Fatalf("encoding = %q, want utf-8", encoding)
+	}
+	if got != string(input) {
+		t.Fatalf("decoded = %q, want %q", got, string(input))
+	}
+}
+
 func TestSharedFileWatcherResolveRelatedFileRecordPlainRoot(t *testing.T) {
 	rootDir := t.TempDir()
 	root := NewRootInfo("root", "plain-root", rootDir)
@@ -269,6 +283,87 @@ func TestSharedFileWatcherResolveRelatedFileRecordSiblingGitWorktree(t *testing.
 	}
 	if record.head != "abc123" {
 		t.Fatalf("head = %q, want abc123", record.head)
+	}
+}
+
+func TestSharedFileWatcherResolveRelatedFileRecordSvn(t *testing.T) {
+	rootDir := t.TempDir()
+	root := NewRootInfo("root", "svn-root", rootDir)
+	watcher := &SharedFileWatcher{
+		root: root,
+		worktreeResolver: func(ctx context.Context, root RootInfo, filePath string) (RelatedWorktreeMatch, bool) {
+			return RelatedWorktreeMatch{
+				Path:     rootDir,
+				Head:     "42",
+				Current:  true,
+				RepoKind: "svn",
+			}, true
+		},
+	}
+
+	record, ok := watcher.resolveRelatedFileRecord(context.Background(), filepath.Join(rootDir, "src", "a.txt"))
+	if !ok {
+		t.Fatal("resolveRelatedFileRecord returned false")
+	}
+	if record.repoKind != "svn" {
+		t.Fatalf("repoKind = %q, want svn", record.repoKind)
+	}
+	if record.repoPath != filepath.Clean(rootDir) {
+		t.Fatalf("repoPath = %q, want %q", record.repoPath, filepath.Clean(rootDir))
+	}
+	if record.head != "42" || record.path != "src/a.txt" {
+		t.Fatalf("unexpected record: %+v", record)
+	}
+}
+
+func TestSharedFileWatcherDoesNotRecordSvnAsGitWorktree(t *testing.T) {
+	rootDir := t.TempDir()
+	root := NewRootInfo("root", "svn-root", rootDir)
+	store := &captureSessionRecorder{}
+	watcher := &SharedFileWatcher{root: root, sessionStore: store}
+	watcher.recordSessionWorktreeMatch(
+		context.Background(),
+		"session-1",
+		RelatedWorktreeMatch{
+			Path:     rootDir,
+			Head:     "42",
+			Current:  true,
+			RepoKind: "svn",
+		},
+		true,
+	)
+	if store.worktreeCalls != 0 {
+		t.Fatalf("RecordRelatedWorktree calls = %d, want 0", store.worktreeCalls)
+	}
+}
+
+type captureSessionRecorder struct {
+	worktreeCalls int
+}
+
+func (r *captureSessionRecorder) RecordOutputFile(context.Context, string, string) error {
+	return nil
+}
+
+func (r *captureSessionRecorder) RecordOutputFileAtHead(context.Context, string, string, string) error {
+	return nil
+}
+
+func (r *captureSessionRecorder) RecordOutputFileInRepo(context.Context, string, string, string, string, string, string, string) error {
+	return nil
+}
+
+func (r *captureSessionRecorder) RecordRelatedWorktree(context.Context, string, string, string, string, string) (bool, error) {
+	r.worktreeCalls++
+	return true, nil
+}
+
+func TestSharedFileWatcherIgnoresSvnMetadata(t *testing.T) {
+	rootDir := t.TempDir()
+	root := NewRootInfo("root", "svn-root", rootDir)
+	watcher := &SharedFileWatcher{root: root}
+	if !watcher.shouldIgnore(filepath.Join(rootDir, ".svn", "entries")) {
+		t.Fatal(".svn metadata should be ignored")
 	}
 }
 

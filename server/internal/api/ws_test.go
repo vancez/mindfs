@@ -403,12 +403,39 @@ func TestRequireWSProofAcceptsValidProof(t *testing.T) {
 	}
 	handler := &WSHandler{AppContext: &AppContext{E2EE: manager}}
 	ts := time.Now().UTC().Format(time.RFC3339)
+	nonce := "MDEyMzQ1Njc4OWFiY2RlZg"
 	proofPath := "/ws?client_id=" + url.QueryEscape(clientID)
-	proof := e2ee.BuildRequestProof(key, http.MethodGet, proofPath, ts, clientID)
-	req := httptest.NewRequest(http.MethodGet, proofPath+"&"+wsTSQuery+"="+url.QueryEscape(ts)+"&"+wsProofQuery+"="+url.QueryEscape(proof), nil)
+	proof := e2ee.BuildRequestProof(key, http.MethodGet, proofPath, ts, nonce, clientID)
+	req := httptest.NewRequest(http.MethodGet, proofPath+"&"+wsTSQuery+"="+url.QueryEscape(ts)+"&"+wsNonceQuery+"="+url.QueryEscape(nonce)+"&"+wsProofQuery+"="+url.QueryEscape(proof), nil)
 
 	if err := handler.requireWSProof(req, clientID); err != nil {
 		t.Fatalf("requireWSProof() error = %v", err)
+	}
+	if err := handler.requireWSProof(req, clientID); err == nil {
+		t.Fatal("expected replayed nonce to be rejected")
+	}
+}
+
+func TestRequireWSProofRejectsMissingNonceWhenE2EEEnabled(t *testing.T) {
+	clientID := "web-test"
+	key := []byte("0123456789abcdef0123456789abcdef")
+	manager := e2ee.NewManager(e2ee.Config{
+		Enabled:       true,
+		NodeID:        "node",
+		PairingSecret: "secret",
+	})
+	if _, err := manager.OpenSessionForClient(clientID, e2ee.DerivedKey{Transport: key}); err != nil {
+		t.Fatalf("OpenSessionForClient: %v", err)
+	}
+	handler := &WSHandler{AppContext: &AppContext{E2EE: manager}}
+	ts := time.Now().UTC().Format(time.RFC3339)
+	nonce := "MDEyMzQ1Njc4OWFiY2RlZg"
+	proofPath := "/ws?client_id=" + url.QueryEscape(clientID)
+	proof := e2ee.BuildRequestProof(key, http.MethodGet, proofPath, ts, nonce, clientID)
+	req := httptest.NewRequest(http.MethodGet, proofPath+"&"+wsTSQuery+"="+url.QueryEscape(ts)+"&"+wsProofQuery+"="+url.QueryEscape(proof), nil)
+
+	if err := handler.requireWSProof(req, clientID); err == nil {
+		t.Fatal("expected missing nonce to be rejected")
 	}
 }
 
@@ -428,9 +455,205 @@ func TestRequireWSProofRejectsMissingProofWhenE2EEEnabled(t *testing.T) {
 }
 
 func TestWSProofPathExcludesProofQueryParams(t *testing.T) {
-	req := httptest.NewRequest(http.MethodGet, "/ws?client_id=web-test&e2ee_ts=now&e2ee_proof=proof", nil)
+	req := httptest.NewRequest(http.MethodGet, "/ws?client_id=web-test&e2ee_ts=now&e2ee_nonce=nonce&e2ee_proof=proof", nil)
 
 	if got, want := wsProofPath(req), "/ws?client_id=web-test"; got != want {
 		t.Fatalf("wsProofPath() = %q, want %q", got, want)
 	}
+}
+
+func TestUpdateToEventContextUpdate(t *testing.T) {
+	window := agenttypes.ContextWindow{TotalTokens: 120, ModelContextWindow: 200_000}
+	event := updateToEvent(agenttypes.Event{
+		Type: agenttypes.EventTypeContextUpdate,
+		Data: agenttypes.ContextUpdate{ContextWindow: window},
+	})
+	if event == nil || event.Type != "context_update" {
+		t.Fatalf("event = %#v, want context_update", event)
+	}
+	update, ok := event.Data.(agenttypes.ContextUpdate)
+	if !ok || update.ContextWindow != window {
+		t.Fatalf("event data = %#v, want context window %#v", event.Data, window)
+	}
+}
+
+func TestUpdateToEventTaskUpdate(t *testing.T) {
+	snapshot := agenttypes.TaskListUpdate{Items: []agenttypes.TaskItem{
+		{ID: "7", Subject: "Check git", Status: "running"},
+	}}
+	event := updateToEvent(agenttypes.Event{
+		Type: agenttypes.EventTypeTaskUpdate,
+		Data: snapshot,
+	})
+	if event == nil || event.Type != "task_update" {
+		t.Fatalf("event = %#v, want task_update", event)
+	}
+	update, ok := event.Data.(agenttypes.TaskListUpdate)
+	if !ok || len(update.Items) != 1 || update.Items[0].ID != "7" {
+		t.Fatalf("event data = %#v, want task snapshot", event.Data)
+	}
+}
+
+func TestStreamHubSessionPendingTracksReplyState(t *testing.T) {
+	hub := NewStreamHub(nil)
+	if hub.SessionPending("sess-1") {
+		t.Fatal("empty session reported pending")
+	}
+	hub.SetPendingReply("root", "sess-1", "Bash")
+	if !hub.SessionPending("sess-1") {
+		t.Fatal("replying session was not reported pending")
+	}
+	hub.ClearSessionPending("sess-1")
+	if hub.SessionPending("sess-1") {
+		t.Fatal("completed session was still reported pending")
+	}
+}
+
+func TestStreamHubTracksFocusedClients(t *testing.T) {
+	hub := NewStreamHub(nil)
+	conn := &websocket.Conn{}
+	hub.RegisterClient("web-focused", conn)
+
+	if hub.HasFocusedClient() {
+		t.Fatal("hub reported a focused client before any focus update")
+	}
+	hub.SetClientFocused("web-focused", true)
+	if !hub.HasFocusedClient() {
+		t.Fatal("focused client was not detected")
+	}
+	hub.SetClientFocused("web-focused", false)
+	if hub.HasFocusedClient() {
+		t.Fatal("unfocused client was still detected")
+	}
+
+	hub.SetClientFocused("web-focused", true)
+	hub.UnregisterClient("web-focused", conn)
+	if hub.HasFocusedClient() {
+		t.Fatal("focus state survived client disconnect")
+	}
+
+	hub.SetClientFocused("web-missing", true)
+	if hub.HasFocusedClient() {
+		t.Fatal("focus state without a connected client was detected")
+	}
+}
+
+func TestWSClientFocusUpdatesHub(t *testing.T) {
+	app := &AppContext{}
+	handler := &WSHandler{AppContext: app}
+	conn := &websocket.Conn{}
+	app.GetSessionStreamHub().RegisterClient("web-1", conn)
+
+	handler.handleClientFocus("web-1", WSRequest{Payload: map[string]any{"focused": true}})
+	if !app.hasFocusedClient() {
+		t.Fatal("focused client was not recorded")
+	}
+	handler.handleClientFocus("web-1", WSRequest{Payload: map[string]any{"focused": false}})
+	if app.hasFocusedClient() {
+		t.Fatal("unfocused client was still recorded")
+	}
+}
+
+func TestStreamHubDecryptWSMessageEnforcesSequence(t *testing.T) {
+	key := []byte("0123456789abcdef0123456789abcdef")
+	hub := NewStreamHub(nil)
+	conn := &websocket.Conn{}
+	payload := []byte(`{"type":"client.focus","payload":{"focused":true}}`)
+
+	first, err := e2ee.EncryptBytesWithAAD(key, e2ee.WSAAD(e2ee.WSFrameClientToServer, 0), payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := hub.DecryptWSMessage(conn, key, first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != string(payload) {
+		t.Fatalf("payload = %q", got)
+	}
+	if _, err := hub.DecryptWSMessage(conn, key, first); err == nil {
+		t.Fatal("expected the replayed frame to be rejected")
+	}
+
+	second, err := e2ee.EncryptBytesWithAAD(key, e2ee.WSAAD(e2ee.WSFrameClientToServer, 1), payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := hub.DecryptWSMessage(conn, key, second); err != nil {
+		t.Fatal(err)
+	}
+
+	outOfOrder, err := e2ee.EncryptBytesWithAAD(key, e2ee.WSAAD(e2ee.WSFrameClientToServer, 3), payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := hub.DecryptWSMessage(conn, key, outOfOrder); err == nil {
+		t.Fatal("expected an out-of-order frame to be rejected")
+	}
+}
+
+func TestStreamHubWriteJSONSequencesFrames(t *testing.T) {
+	key := []byte("0123456789abcdef0123456789abcdef")
+	manager := e2ee.NewManager(e2ee.Config{Enabled: true, NodeID: "node", PairingSecret: "secret"})
+	if _, err := manager.OpenSessionForClient("client-1", e2ee.DerivedKey{Transport: key}); err != nil {
+		t.Fatal(err)
+	}
+	hub := NewStreamHub(manager)
+	serverConnCh := make(chan *websocket.Conn, 1)
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		hub.RegisterClient("client-1", conn)
+		serverConnCh <- conn
+		<-release
+		hub.UnregisterClient("client-1", conn)
+		conn.Close()
+	}))
+	defer srv.Close()
+
+	dialURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+	clientConn, _, err := websocket.DefaultDialer.Dial(dialURL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer clientConn.Close()
+	serverConn := <-serverConnCh
+
+	first := WSResponse{Type: "test.first", Payload: map[string]any{"n": 1}}
+	second := WSResponse{Type: "test.second", Payload: map[string]any{"n": 2}}
+	if err := hub.WriteJSON("client-1", serverConn, first); err != nil {
+		t.Fatal(err)
+	}
+	var firstEnvelope e2ee.CipherEnvelope
+	if err := clientConn.ReadJSON(&firstEnvelope); err != nil {
+		t.Fatal(err)
+	}
+	firstPlaintext, err := e2ee.DecryptBytesWithAAD(key, e2ee.WSAAD(e2ee.WSFrameServerToClient, 0), &firstEnvelope)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(firstPlaintext), `"test.first"`) {
+		t.Fatalf("first frame = %s", firstPlaintext)
+	}
+	if err := hub.WriteJSON("client-1", serverConn, second); err != nil {
+		t.Fatal(err)
+	}
+	var secondEnvelope e2ee.CipherEnvelope
+	if err := clientConn.ReadJSON(&secondEnvelope); err != nil {
+		t.Fatal(err)
+	}
+	secondPlaintext, err := e2ee.DecryptBytesWithAAD(key, e2ee.WSAAD(e2ee.WSFrameServerToClient, 1), &secondEnvelope)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(secondPlaintext), `"test.second"`) {
+		t.Fatalf("second frame = %s", secondPlaintext)
+	}
+	if _, err := e2ee.DecryptBytesWithAAD(key, e2ee.WSAAD(e2ee.WSFrameServerToClient, 0), &secondEnvelope); err == nil {
+		t.Fatal("expected a replayed sequence to be rejected")
+	}
+	close(release)
 }

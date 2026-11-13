@@ -89,6 +89,7 @@ type ActionBarProps = {
   onCreateTask?: SessionQuickActionsProps["onCreateTask"];
   onOpenScheduledTasks?: SessionQuickActionsProps["onOpenScheduledTasks"];
   taskGroupBadge?: React.ReactNode;
+  sessionStatusBadge?: React.ReactNode;
   status?: WSStatus;
   agentsVersion?: number;
   codexRateLimitsRefreshToken?: number;
@@ -407,6 +408,7 @@ export function ActionBar({
   onSelectProject,
   onSelectSession,
   taskGroupBadge,
+  sessionStatusBadge,
   status = "disconnected",
   agentsVersion = 0,
   codexRateLimitsRefreshToken = 0,
@@ -493,10 +495,52 @@ export function ActionBar({
   const inputHistoryDraftRef = useRef("");
   const applyingInputHistoryRef = useRef(false);
   const { isMobile } = useResponsive();
+  const inputControlsRef = useRef<HTMLDivElement | null>(null);
+  const previousInputControlsWidthRef = useRef(0);
+  const [inputControlsWidth, setInputControlsWidth] = useState(0);
   const isConnected = status === "connected";
   const [displayStatus, setDisplayStatus] = useState<WSStatus>(status);
   const reconnectDisplayTimerRef = useRef<number | null>(null);
   const connectionMeta = wsStatusMeta(displayStatus, t);
+
+  // The composer controls float over the editor. Their width varies with the
+  // selected mode/agent and with the viewport, so reserve the measured width
+  // instead of a fixed inset; otherwise the leftmost control (quick switch)
+  // slides over the last characters of a long draft.
+  useEffect(() => {
+    const element = inputControlsRef.current;
+    if (!element) {
+      return;
+    }
+    const measure = () => {
+      const width = Math.ceil(element.getBoundingClientRect().width);
+      setInputControlsWidth((previous) => (previous === width ? previous : width));
+    };
+    measure();
+    if (typeof ResizeObserver === "undefined") {
+      return;
+    }
+    const observer = new ResizeObserver(measure);
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, []);
+
+  // Controls can grow while a draft is already wrapped as single-line (for
+  // example after switching agent). Promote to the multi-line layout so the
+  // new inset cannot leave text hidden behind the controls.
+  useEffect(() => {
+    const previous = previousInputControlsWidthRef.current;
+    previousInputControlsWidthRef.current = inputControlsWidth;
+    if (!inputControlsWidth || inputControlsWidth <= previous || isMultiLine) {
+      return;
+    }
+    const frame = window.requestAnimationFrame(() => {
+      if (editorRef.current && editorRef.current.getHeight() > 50) {
+        setIsMultiLine(true);
+      }
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [inputControlsWidth, isMultiLine]);
 
   useEffect(() => {
     if (reconnectDisplayTimerRef.current) {
@@ -1316,7 +1360,11 @@ export function ActionBar({
       ? t(placeholderVariant === 1 ? "action.placeholder.tip" : "action.placeholder.quickSwitch")
       : t(currentSession ? "action.placeholder.continueSession" : "action.placeholder.newSession")
     : t(mode === "command" ? "action.placeholder.command" : "action.placeholder.plugin");
-  const editorRightInset = isMultiLine ? 14 : mode === "command" ? (isMobile ? 84 : 108) : isMobile ? 116 : 140;
+  const inputControlsRightOffset = isMobile ? 4 : 8;
+  const singleLineRightInset = mode === "command" ? (isMobile ? 84 : 108) : isMobile ? 116 : 140;
+  const editorRightInset = isMultiLine
+    ? 14
+    : Math.ceil(Math.max(singleLineRightInset, inputControlsWidth + inputControlsRightOffset + 8));
   const editorBottomInset = isMultiLine ? 44 : 12;
   const editorMinHeight = 44;
   const mobileFileSidebarButton = isMobile ? (
@@ -1349,7 +1397,7 @@ export function ActionBar({
   ) : null;
 
   return (
-    <div data-onboarding="action-bar" style={{ width: "100%", minWidth: 0, padding: isMobile ? "0 0 var(--mindfs-actionbar-bottom-padding, calc(env(safe-area-inset-bottom, 0px) + 2px))" : "0 16px 12px", display: "flex", justifyContent: "center", boxSizing: "border-box", background: "var(--content-bg)" }}>
+    <div data-onboarding="action-bar" style={{ width: "100%", minWidth: 0, padding: isMobile ? "0 0 var(--mindfs-actionbar-bottom-padding, 12px)" : "0 16px 12px", display: "flex", justifyContent: "center", boxSizing: "border-box", background: "var(--content-bg)" }}>
       <div style={{ position: "relative", width: "100%", minWidth: 0, display: "flex", flexDirection: "column", gap: 0 }}>
         <div
             style={{
@@ -1362,7 +1410,8 @@ export function ActionBar({
               display: "flex",
               alignItems: "flex-end",
               justifyContent: "space-between",
-              gap: "8px",
+              flexWrap: "wrap",
+              gap: "4px 8px",
               pointerEvents: "none",
             }}
           >
@@ -1393,8 +1442,9 @@ export function ActionBar({
                 </>
               ) : null}
             </div>
-            <div style={{ pointerEvents: "auto", display: "inline-flex", alignItems: "flex-end", gap: "6px" }}>
-              <AgentMemoryIndicator refreshToken={agentsVersion + codexRateLimitsRefreshToken} />
+            <div style={{ pointerEvents: "auto", display: "inline-flex", alignItems: "flex-end", flexWrap: "wrap", justifyContent: "flex-end", gap: "6px", minWidth: 0, maxWidth: "100%" }}>
+              {sessionStatusBadge}
+              <AgentMemoryIndicator refreshToken={agentsVersion + codexRateLimitsRefreshToken} compact={isMobile} />
               <CodexRateLimitIndicator agent={agent} refreshToken={codexRateLimitsRefreshToken} />
             </div>
         </div>
@@ -1868,7 +1918,7 @@ export function ActionBar({
               }}
             />
 
-            <div data-onboarding="input-controls" style={{ position: "absolute", right: isMobile ? "4px" : "8px", bottom: isMultiLine ? "6px" : "50%", transform: isMultiLine ? "none" : "translateY(50%)", display: "flex", alignItems: "center", gap: isMobile ? "0px" : "2px", zIndex: 5, transition: "all 0.2s cubic-bezier(0.4, 0, 0.2, 1)" }}>
+            <div ref={inputControlsRef} data-onboarding="input-controls" style={{ position: "absolute", right: `${inputControlsRightOffset}px`, bottom: isMultiLine ? "6px" : "50%", transform: isMultiLine ? "none" : "translateY(50%)", display: "flex", alignItems: "center", gap: isMobile ? "0px" : "2px", zIndex: 5, transition: "all 0.2s cubic-bezier(0.4, 0, 0.2, 1)" }}>
               <SessionQuickActions currentRootId={currentRootId} currentSessionKey={currentSession?.key || currentSession?.session_key} currentDirPath={currentDirPath} gestureConfig={blueRingGestures} roots={roots} onNewSession={() => { resetForNewSession(); onNewSession(); }} onSelectProject={onSelectProject} onSelectSession={onSelectSession} onToggleFileSidebar={onToggleLeftSidebar} onToggleSessionSidebar={onToggleRightSidebar} onOpenModelSelector={() => setModelSelectorSignal((value) => value + 1)} onToggleRecentAgent={toggleRecentAgent} onPickAgent={pickAgent} onOpenRecentDirectory={onOpenRecentDirectory} onToggleMultiProjectSessions={onToggleMultiProjectSessions} onToggleEnterKeySends={onToggleEnterKeySends} onCycleMainFontScale={onCycleMainFontScale} onToggleMainContentView={onToggleMainContentView} onCycleKanbanTemplate={onCycleKanbanTemplate} onCreateTask={onCreateTask} onOpenScheduledTasks={onOpenScheduledTasks} />
               <>
                 <ModeSelector mode={mode} onModeChange={setMode} compact={true} disabled={isModeLocked} onboardingId="mode-selector" viewportMenu />

@@ -1,0 +1,2 @@
+# Batch files need CRLF in the working tree; cmd.exe is most reliable with it.
+*.bat text eol=crlf

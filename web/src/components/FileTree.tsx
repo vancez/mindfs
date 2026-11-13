@@ -95,6 +95,7 @@ type BeforeInstallPromptEvent = Event & {
 
 const PWA_INSTALL_STATE_KEY = "mindfs-pwa-installed";
 const RELAYER_AD_DISMISS_STORAGE_KEY = "mindfs-relayer-ad-dismissed";
+const SIDEBAR_FOOTER_HIDDEN_STORAGE_KEY = "mindfs-sidebar-footer-hidden";
 
 const APPEARANCE_OPTIONS: Array<{ value: AppearanceMode; labelKey: MessageKey }> = [
   { value: "dark", labelKey: "appearance.dark" },
@@ -140,7 +141,7 @@ type RootSessionIndicator = {
   pending?: boolean;
 };
 
-export type ProjectTreeTab = "files" | "git" | "worktrees" | "related";
+export type ProjectTreeTab = "files" | "git" | "svn" | "worktrees" | "related";
 export type AgentConfigSwitchRequest = {
   nonce: number;
   providerIDs?: string[];
@@ -151,8 +152,18 @@ const PROJECT_TREE_ROOT_PADDING_LEFT = 0;
 const PROJECT_TREE_INDENT = 16;
 
 function isProjectTreeTab(value: unknown): value is ProjectTreeTab {
-  return value === "files" || value === "git" || value === "worktrees" || value === "related";
+  return value === "files" || value === "git" || value === "svn" || value === "worktrees" || value === "related";
 }
+
+// Git, SVN, worktree and related-file views describe the project selected in
+// the sidebar, so those tabs list only the current managed root instead of
+// every project (matching the SVN tab behavior).
+const PROJECT_SCOPED_TREE_TABS: ReadonlySet<ProjectTreeTab> = new Set([
+  "git",
+  "svn",
+  "worktrees",
+  "related",
+]);
 
 type FileTreeProps = {
   entries: FileEntry[];
@@ -173,8 +184,10 @@ type FileTreeProps = {
   onSelectRoot?: (entry: FileEntry, rootId: string) => void;
   onToggleDir?: (entry: FileEntry, rootId: string) => void;
   renderRootExtraContent?: (rootId: string) => React.ReactNode;
+  renderRootSvnContent?: (rootId: string) => React.ReactNode;
   renderRootWorktreeContent?: (rootId: string) => React.ReactNode;
   renderRootRelatedContent?: (rootId: string) => React.ReactNode;
+  currentRootIsSvnRepo?: boolean;
   projectTreeTabRequest?: { tab: ProjectTreeTab; nonce: number } | null;
   agentConfigSwitchRequest?: AgentConfigSwitchRequest | null;
   onAgentConfigSwitched?: (agent: string) => void;
@@ -1433,8 +1446,10 @@ export function FileTree({
   onSelectRoot,
   onToggleDir,
   renderRootExtraContent,
+  renderRootSvnContent,
   renderRootWorktreeContent,
   renderRootRelatedContent,
+  currentRootIsSvnRepo = false,
   projectTreeTabRequest = null,
   agentConfigSwitchRequest = null,
   onAgentConfigSwitched,
@@ -1505,6 +1520,56 @@ export function FileTree({
       return "files";
     }
   });
+  // Root expansion in the non-files tabs is intentionally independent from the
+  // Files tab so collapsing a project in one view does not hide another view.
+  const [tabRootCollapsed, setTabRootCollapsed] = React.useState<Record<string, boolean>>({});
+  const tabRootStateKey = React.useCallback(
+    (tab: ProjectTreeTab, path: string) => `${tab}::${path}`,
+    [],
+  );
+  const [hideSidebarFooter, setHideSidebarFooter] = React.useState(() => {
+    if (typeof window === "undefined") {
+      return false;
+    }
+    try {
+      return window.localStorage.getItem(SIDEBAR_FOOTER_HIDDEN_STORAGE_KEY) === "1";
+    } catch {
+      return false;
+    }
+  });
+  React.useEffect(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+    try {
+      window.localStorage.setItem(
+        SIDEBAR_FOOTER_HIDDEN_STORAGE_KEY,
+        hideSidebarFooter ? "1" : "0",
+      );
+    } catch {
+    }
+  }, [hideSidebarFooter]);
+  const availableProjectTreeTabs = React.useMemo<ProjectTreeTab[]>(
+    () =>
+      currentRootIsSvnRepo
+        ? ["files", "svn", "related"]
+        : ["files", "git", "worktrees", "related"],
+    [currentRootIsSvnRepo],
+  );
+  React.useEffect(() => {
+    // Before the current root is known, keep the persisted tab so an SVN tab
+    // can be restored after a reload.
+    if (!rootId || availableProjectTreeTabs.includes(projectTreeTab)) {
+      return;
+    }
+    const next: ProjectTreeTab =
+      projectTreeTab === "svn" && availableProjectTreeTabs.includes("git")
+        ? "git"
+        : projectTreeTab === "git" && availableProjectTreeTabs.includes("svn")
+          ? "svn"
+          : "files";
+    setProjectTreeTab(next);
+  }, [availableProjectTreeTabs, projectTreeTab, rootId]);
   const handleTabRefresh = React.useCallback(
     () => onRefresh?.(projectTreeTab),
     [onRefresh, projectTreeTab],
@@ -1651,12 +1716,27 @@ export function FileTree({
 
   const [isNativeApp, setIsNativeApp] = React.useState(() => isNativeShellRuntime());
 
+  const appliedTabRequestNonceRef = React.useRef(0);
   React.useEffect(() => {
     if (!projectTreeTabRequest || !isProjectTreeTab(projectTreeTabRequest.tab)) {
       return;
     }
+    if (!availableProjectTreeTabs.includes(projectTreeTabRequest.tab)) {
+      return;
+    }
+    // Apply each request once. The available-tab list changes identity when
+    // the root switches between Git and SVN; without this guard an old
+    // "related" request would force the tab back on every such switch.
+    if (appliedTabRequestNonceRef.current === projectTreeTabRequest.nonce) {
+      return;
+    }
+    appliedTabRequestNonceRef.current = projectTreeTabRequest.nonce;
     setProjectTreeTab(projectTreeTabRequest.tab);
-  }, [projectTreeTabRequest?.nonce, projectTreeTabRequest?.tab]);
+  }, [
+    availableProjectTreeTabs,
+    projectTreeTabRequest?.nonce,
+    projectTreeTabRequest?.tab,
+  ]);
 
   React.useEffect(() => {
     onProjectTreeTabChange?.(projectTreeTab);
@@ -2740,7 +2820,7 @@ export function FileTree({
     const hiddenFiltered = showHiddenFiles
       ? items
       : items.filter((entry) => !entry.name.startsWith("."));
-    if (projectTreeTab !== "related" || depth !== 0) {
+    if (!PROJECT_SCOPED_TREE_TABS.has(projectTreeTab) || depth !== 0) {
       return hiddenFiltered;
     }
     return hiddenFiltered.filter((entry) => !!rootId && entry.path === rootId);
@@ -2855,7 +2935,10 @@ export function FileTree({
         const isManagedRootNode = entry.is_root === true;
         const entryRoot = isManagedRootNode ? entry.path : branchRoot;
         const expandedKey = isManagedRootNode ? entry.path : `${entryRoot}:${entry.path}`;
-        const isOpen = expandedSet.has(expandedKey);
+        const usesTabRootExpansion = isManagedRootNode && projectTreeTab !== "files";
+        const isOpen = usesTabRootExpansion
+          ? tabRootCollapsed[tabRootStateKey(projectTreeTab, entry.path)] !== true
+          : expandedSet.has(expandedKey);
 
         const cKey = childKeyFor(entry, entryRoot);
         const children = childrenByPath[cKey] ?? [];
@@ -2891,17 +2974,32 @@ export function FileTree({
             return;
           }
           event.stopPropagation();
+          if (usesTabRootExpansion) {
+            setTabRootCollapsed((prev) => {
+              const key = tabRootStateKey(projectTreeTab, entry.path);
+              const next = { ...prev };
+              if (next[key]) {
+                delete next[key];
+              } else {
+                next[key] = true;
+              }
+              return next;
+            });
+            return;
+          }
           onToggleDir?.(entry, entryRoot);
         };
 
         const rootExtraContent = isManagedRootNode
           ? projectTreeTab === "git"
             ? renderRootExtraContent?.(entry.path)
-            : projectTreeTab === "worktrees"
-              ? renderRootWorktreeContent?.(entry.path)
-            : projectTreeTab === "related"
-              ? renderRootRelatedContent?.(entry.path)
-              : null
+            : projectTreeTab === "svn"
+              ? renderRootSvnContent?.(entry.path)
+              : projectTreeTab === "worktrees"
+                ? renderRootWorktreeContent?.(entry.path)
+                : projectTreeTab === "related"
+                  ? renderRootRelatedContent?.(entry.path)
+                  : null
           : null;
         const shouldRenderChildren = projectTreeTab === "files" || !isManagedRootNode;
 
@@ -3021,12 +3119,17 @@ export function FileTree({
               width: "100%",
             }}
           >
-            {([
-              ["files", t("fileTree.files")],
-              ["git", "git"],
-              ["worktrees", t("fileTree.worktrees")],
-              ["related", t("fileTree.relatedFiles")],
-            ] as const).map(([value, label], index) => {
+            {availableProjectTreeTabs.map((value, index) => {
+              const label =
+                value === "files"
+                  ? t("fileTree.files")
+                  : value === "git"
+                    ? "git"
+                    : value === "svn"
+                      ? t("fileTree.svn")
+                      : value === "worktrees"
+                        ? t("fileTree.worktrees")
+                        : t("fileTree.relatedFiles");
               const active = projectTreeTab === value;
               const flexGrow = value === "related" ? 1.45 : value === "worktrees" ? 1.15 : 0.85;
               return (
@@ -3664,6 +3767,30 @@ export function FileTree({
               >
                 <span>{t("fileTree.showHiddenFiles")}</span>
                 <span aria-hidden="true" style={{ fontSize: "11px", opacity: showHiddenFiles ? 1 : 0 }}>✓</span>
+              </button>
+              <button
+                type="button"
+                data-menu-category="files"
+                data-menu-order={25}
+                aria-pressed={hideSidebarFooter}
+                onClick={() => setHideSidebarFooter((hidden) => !hidden)}
+                style={{
+                  width: "100%",
+                  border: "none",
+                  background: hideSidebarFooter ? "var(--selection-bg)" : "transparent",
+                  color: hideSidebarFooter ? "var(--accent-color)" : "var(--text-primary)",
+                  borderRadius: "8px",
+                  padding: "8px 10px",
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "space-between",
+                  textAlign: "left",
+                  cursor: "pointer",
+                  fontSize: "12px",
+                }}
+              >
+                <span>{t("fileTree.hideSidebarFooter")}</span>
+                <span style={{ fontSize: "11px", opacity: hideSidebarFooter ? 1 : 0 }}>✓</span>
               </button>
               <button
                 type="button"
@@ -4425,7 +4552,7 @@ export function FileTree({
         style={{
           padding: hasFooterContent ? "10px 12px 12px" : "0",
           borderTop: hasFooterContent ? "1px solid var(--border-color)" : "none",
-          display: "flex",
+          display: hideSidebarFooter ? "none" : "flex",
           flexDirection: "column",
           gap: "6px",
           flexShrink: 0,

@@ -1,5 +1,7 @@
 import { appURL } from "./base";
-import { e2eeService } from "./e2ee";
+import { e2eeService, type FileProofContext } from "./e2ee";
+import { buildEncryptedUploadBody } from "./e2eeMultipart";
+import { E2EE_STREAM_MARKER_HEADER, E2EE_STREAM_MARKER_UPLOAD } from "./e2eeStream";
 
 export type UploadedFile = {
   path: string;
@@ -27,20 +29,36 @@ export async function uploadFiles(params: {
   onProgress?: (progress: UploadProgress) => void;
   signal?: AbortSignal;
 }): Promise<UploadedFile[]> {
-  const formData = new FormData();
-  params.files.forEach((file) => {
-    formData.append("files", file);
-  });
-  if (params.dir) {
-    formData.append("dir", params.dir);
-  }
-
   const query = new URLSearchParams({ root: params.rootId });
   const requestURL = appURL("/api/upload", query);
-  const headers = e2eeService.isRequired()
-    ? await e2eeService.fileProofHeaders("POST", requestURL)
-    : undefined;
-  const response = await uploadFormData(requestURL, formData, headers, params.onProgress, params.signal);
+  let body: FormData | Blob;
+  let headers: Headers | undefined;
+  let proof: FileProofContext | null = null;
+  if (e2eeService.isRequired()) {
+    proof = await e2eeService.fileProofContext("POST", requestURL);
+    const encrypted = await buildEncryptedUploadBody({
+      files: params.files,
+      dir: params.dir,
+      key: proof.key,
+      requestNonce: proof.nonce,
+      signal: params.signal,
+    });
+    headers = new Headers(proof.headers);
+    headers.set("Content-Type", `multipart/form-data; boundary=${encrypted.boundary}`);
+    headers.set(E2EE_STREAM_MARKER_HEADER, E2EE_STREAM_MARKER_UPLOAD);
+    body = encrypted.blob;
+  } else {
+    const formData = new FormData();
+    params.files.forEach((file) => {
+      formData.append("files", file);
+    });
+    if (params.dir) {
+      formData.append("dir", params.dir);
+    }
+    body = formData;
+  }
+
+  const response = await uploadBody(requestURL, body, headers, params.onProgress, params.signal);
   if (!response.ok) {
     if (response.status === 401 && e2eeService.isRequired()) {
       const payload = (await response.json().catch(() => ({}))) as { error?: string };
@@ -59,7 +77,10 @@ export async function uploadFiles(params: {
     }
     throw new Error(message);
   }
-  const payload = await e2eeService.parseProtectedJSONResponse<UploadResponse>(response);
+  const payload = await e2eeService.parseProtectedJSONResponse<UploadResponse>(
+    response,
+    proof ? { context: proof.context } : undefined,
+  );
   return Array.isArray(payload.files) ? payload.files : [];
 }
 
@@ -67,10 +88,10 @@ export function isUploadAbortError(error: unknown): boolean {
   return error instanceof Error && error.name === "AbortError";
 }
 
-function uploadFormData(
+function uploadBody(
   requestURL: string,
-  formData: FormData,
-  headers?: Headers,
+  body: FormData | Blob,
+  headers: Headers | undefined,
   onProgress?: (progress: UploadProgress) => void,
   signal?: AbortSignal,
 ): Promise<Response> {
@@ -100,8 +121,8 @@ function uploadFormData(
       onProgress?.({
         loaded: event.loaded,
         total: event.total,
-        speedBps: lastSpeedBps,
         percent: Math.min(100, Math.max(0, Math.round((event.loaded / event.total) * 100))),
+        speedBps: lastSpeedBps,
       });
     };
     const cleanup = () => {
@@ -132,7 +153,7 @@ function uploadFormData(
         headers: parseXHRHeaders(xhr.getAllResponseHeaders()),
       }));
     };
-    xhr.send(formData);
+    xhr.send(body);
   });
 }
 

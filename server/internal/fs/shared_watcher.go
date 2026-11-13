@@ -22,6 +22,7 @@ var ignoredWatchNames = map[string]struct{}{
 	".cache":        {},
 	".git":          {},
 	".gradle":       {},
+	".svn":          {},
 	".mindfs":       {},
 	".mypy_cache":   {},
 	".next":         {},
@@ -53,6 +54,7 @@ type SharedFileWatcher struct {
 	sessionStore SessionFileRecorder
 
 	mu                sync.RWMutex
+	watchAddMu        sync.Mutex
 	sessions          map[string]*sessionInfo
 	watchedDirs       map[string]struct{}
 	pendingWrites     map[string]string
@@ -101,10 +103,11 @@ type RelatedFileEvent struct {
 }
 
 type RelatedWorktreeMatch struct {
-	Path    string
-	Branch  string
-	Head    string
-	Current bool
+	Path     string
+	Branch   string
+	Head     string
+	Current  bool
+	RepoKind string `json:"repo_kind,omitempty"`
 }
 
 type relatedFileRecord struct {
@@ -187,8 +190,10 @@ func (sw *SharedFileWatcher) RecordSessionFile(sessionKey, filePath string) {
 	if sw.sessionStore == nil || sessionKey == "" || filePath == "" {
 		return
 	}
-	sw.recordSessionWorktree(context.Background(), sessionKey, filePath)
-	record, ok := sw.resolveRelatedFileRecord(context.Background(), filePath)
+	ctx := context.Background()
+	match, matched := sw.resolveRelatedRepoMatch(ctx, filePath)
+	sw.recordSessionWorktreeMatch(ctx, sessionKey, match, matched)
+	record, ok := sw.relatedFileRecordFromMatch(filePath, match, matched)
 	if !ok {
 		return
 	}
@@ -214,22 +219,36 @@ func (sw *SharedFileWatcher) RecordSessionFile(sessionKey, filePath string) {
 	})
 }
 
+func (sw *SharedFileWatcher) resolveRelatedRepoMatch(ctx context.Context, filePath string) (RelatedWorktreeMatch, bool) {
+	if sw.worktreeResolver == nil || filePath == "" {
+		return RelatedWorktreeMatch{}, false
+	}
+	return sw.worktreeResolver(ctx, sw.root, filePath)
+}
+
 func (sw *SharedFileWatcher) resolveRelatedFileRecord(ctx context.Context, filePath string) (relatedFileRecord, bool) {
+	match, matched := sw.resolveRelatedRepoMatch(ctx, filePath)
+	return sw.relatedFileRecordFromMatch(filePath, match, matched)
+}
+
+func (sw *SharedFileWatcher) relatedFileRecordFromMatch(filePath string, match RelatedWorktreeMatch, matched bool) (relatedFileRecord, bool) {
 	absFilePath := absoluteRelatedFilePath(sw.root.RootPath, filePath)
-	if sw.worktreeResolver != nil && filePath != "" {
-		if match, ok := sw.worktreeResolver(ctx, sw.root, filePath); ok {
-			relPath, ok := relativePathInside(match.Path, absFilePath)
-			if ok && validRelatedPath(relPath) {
-				repoPath := filepath.Clean(match.Path)
-				return relatedFileRecord{
-					rootID:   sw.root.ID,
-					repoKind: "git",
-					repoPath: repoPath,
-					repoName: filepath.Base(repoPath),
-					path:     relPath,
-					head:     strings.TrimSpace(match.Head),
-				}, true
+	if matched {
+		relPath, ok := relativePathInside(match.Path, absFilePath)
+		if ok && validRelatedPath(relPath) {
+			repoPath := filepath.Clean(match.Path)
+			repoKind := strings.TrimSpace(match.RepoKind)
+			if repoKind == "" {
+				repoKind = "git"
 			}
+			return relatedFileRecord{
+				rootID:   sw.root.ID,
+				repoKind: repoKind,
+				repoPath: repoPath,
+				repoName: filepath.Base(repoPath),
+				path:     relPath,
+				head:     strings.TrimSpace(match.Head),
+			}, true
 		}
 	}
 
@@ -294,12 +313,11 @@ func sameCleanPath(a, b string) bool {
 	return filepath.Clean(strings.TrimSpace(a)) == filepath.Clean(strings.TrimSpace(b))
 }
 
-func (sw *SharedFileWatcher) recordSessionWorktree(ctx context.Context, sessionKey, filePath string) {
-	if sw.sessionStore == nil || sw.worktreeResolver == nil || sessionKey == "" || filePath == "" {
+func (sw *SharedFileWatcher) recordSessionWorktreeMatch(ctx context.Context, sessionKey string, match RelatedWorktreeMatch, matched bool) {
+	if sw.sessionStore == nil || sessionKey == "" || !matched {
 		return
 	}
-	match, ok := sw.worktreeResolver(ctx, sw.root, filePath)
-	if !ok {
+	if kind := strings.TrimSpace(match.RepoKind); kind != "" && kind != "git" {
 		return
 	}
 	if added, err := sw.sessionStore.RecordRelatedWorktree(ctx, sessionKey, sw.root.ID, match.Path, match.Branch, match.Head); err == nil && added {
@@ -393,7 +411,11 @@ func (sw *SharedFileWatcher) run() {
 					Op:     event.Op.String(),
 					IsDir:  true,
 				})
-				_ = sw.WatchDir(rel)
+				// fsnotify.Add may wait for the backend event reader. Calling it
+				// synchronously from this loop deadlocks on Windows: the same
+				// goroutine is the reader that must drain Events. Add the watch
+				// asynchronously so the event loop stays free.
+				go func() { _ = sw.WatchDir(rel) }()
 				continue
 			}
 			sw.emitFileChange(FileChangeEvent{
@@ -557,21 +579,36 @@ func (sw *SharedFileWatcher) WatchDir(dirRel string) error {
 		return nil
 	}
 	clean := filepath.Clean(dirAbs)
+	// fsnotify.Add may block on its own event loop; never hold sw.mu across it.
+	// A dedicated mutex keeps concurrent WatchDir calls from adding the same
+	// directory twice while letting event batches proceed.
+	sw.watchAddMu.Lock()
+	defer sw.watchAddMu.Unlock()
+	sw.mu.RLock()
+	select {
+	case <-sw.done:
+		sw.mu.RUnlock()
+		return nil
+	default:
+	}
+	if _, ok := sw.watchedDirs[clean]; ok {
+		sw.mu.RUnlock()
+		return nil
+	}
+	if len(sw.watchedDirs) >= maxWatchDirs {
+		sw.mu.RUnlock()
+		return nil
+	}
+	sw.mu.RUnlock()
+	if err := sw.watcher.Add(clean); err != nil {
+		return err
+	}
 	sw.mu.Lock()
 	defer sw.mu.Unlock()
 	select {
 	case <-sw.done:
 		return nil
 	default:
-	}
-	if _, ok := sw.watchedDirs[clean]; ok {
-		return nil
-	}
-	if len(sw.watchedDirs) >= maxWatchDirs {
-		return nil
-	}
-	if err := sw.watcher.Add(clean); err != nil {
-		return err
 	}
 	sw.watchedDirs[clean] = struct{}{}
 	return nil

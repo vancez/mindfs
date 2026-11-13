@@ -292,6 +292,87 @@ func TestImportExternalSessionCreatesNativeSubagentSession(t *testing.T) {
 	}
 }
 
+func TestSyncImportedSubagentSessionsAdoptsLiveChild(t *testing.T) {
+	ctx := context.Background()
+	root := fs.NewRootInfo("root", "Root", t.TempDir())
+	manager := session.NewManager(root)
+	parent, err := manager.Create(ctx, session.CreateInput{Type: session.TypeChat, Agent: "claude", Name: "parent"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	child, err := manager.Create(ctx, session.CreateInput{
+		Type:             session.TypeChat,
+		ParentSessionKey: parent.Key,
+		ParentToolCallID: "tool-1",
+		Agent:            "claude",
+		Name:             "live child",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.AddExchangeForAgent(ctx, child, "user", "do work", "claude", "default", "medium", "off"); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.AddExchangeForAgent(ctx, child, "agent", "done", "claude", "default", "medium", "off"); err != nil {
+		t.Fatal(err)
+	}
+	// Production overwrites the router binding with the synthetic runtime id
+	// when the live reply finishes.
+	if err := manager.UpdateAgentState(ctx, child, "claude", 2, "tool-1"); err != nil {
+		t.Fatal(err)
+	}
+
+	item := agenttypes.ImportedSubagentSession{
+		AgentSessionID:   "claude-subagent:agent-1",
+		ParentToolCallID: "tool-1",
+		Title:            "live child",
+		Cursor:           agenttypes.ExternalSessionCursor{SourcePath: "/agent/child.jsonl", Offset: 10, ModTimeUnixNano: 20},
+		Exchanges: []agenttypes.ImportedExchange{
+			{Role: "user", Content: "do work"},
+			{Role: "agent", Content: "done"},
+		},
+	}
+	count, err := syncImportedSubagentSessions(ctx, manager, parent, "claude", []agenttypes.ImportedSubagentSession{item})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("importedCount = %d, want 0 for adopted live child", count)
+	}
+	children, err := manager.List(ctx, session.ListOptions{ParentSessionKey: parent.Key})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(children) != 1 || children[0].Key != child.Key {
+		t.Fatalf("children = %#v, want the single live child", children)
+	}
+	binding, err := manager.FindAgentBindingByAgentSession(ctx, "claude", "claude-subagent:agent-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if binding == nil || binding.SessionKey != child.Key {
+		t.Fatalf("binding = %#v, want live child re-bound to the external id", binding)
+	}
+	latest, err := manager.Get(ctx, child.Key, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(latest.Exchanges) != 2 || latest.Exchanges[0].Role != "user" || latest.Exchanges[1].Content != "done" {
+		t.Fatalf("adopted exchanges = %#v", latest.Exchanges)
+	}
+
+	item.Unchanged = true
+	item.Exchanges = nil
+	count, err = syncImportedSubagentSessions(ctx, manager, parent, "claude", []agenttypes.ImportedSubagentSession{item})
+	if err != nil || count != 0 {
+		t.Fatalf("unchanged adopted sync: count=%d err=%v", count, err)
+	}
+	latest, err = manager.Get(ctx, child.Key, 0)
+	if err != nil || len(latest.Exchanges) != 2 {
+		t.Fatalf("unchanged adopted history: %+v %v", latest, err)
+	}
+}
+
 func TestImportExternalSessionPersistsPlanAux(t *testing.T) {
 	ctx := context.Background()
 	root := fs.NewRootInfo("root", "Root", t.TempDir())

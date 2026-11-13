@@ -57,7 +57,7 @@ func TestDetachSessionPreservesHistoryAndDescendants(t *testing.T) {
 	if err != nil || binding == nil || binding.AgentSessionID != "native-session" {
 		t.Fatalf("agent binding changed: %+v %v", binding, err)
 	}
-	if err := service.DeleteSession(ctx, DeleteSessionInput{RootID: root.ID, Key: parent.Key}); err != nil {
+	if _, err := service.DeleteSession(ctx, DeleteSessionInput{RootID: root.ID, Key: parent.Key}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := m.Get(ctx, sibling.Key, 0); err == nil {

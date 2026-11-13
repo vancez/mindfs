@@ -211,6 +211,7 @@ type session struct {
 	planMode   bool
 
 	mu            sync.RWMutex
+	emitMu        sync.Mutex
 	onUpdate      func(types.Event)
 	turn          types.TurnCanceler
 	contextWindow types.ContextWindow
@@ -634,32 +635,69 @@ func codexAskUserResponse(questions []codexsdk.AskUserQuestion, answers map[stri
 		if key == "" || value == "" {
 			continue
 		}
-		questionID := codexQuestionIDForAnswerKey(key, questions)
+		question, ok := codexQuestionForAnswerKey(key, questions)
+		if !ok {
+			continue
+		}
+		questionID := strings.TrimSpace(question.ID)
 		if questionID == "" {
 			continue
 		}
 		response.Answers[questionID] = codexsdk.AskUserAnswer{
-			Answers: []string{value},
+			Answers: codexAskUserAnswerValues(question, value),
 		}
 	}
 	return response
 }
 
-func codexQuestionIDForAnswerKey(key string, questions []codexsdk.AskUserQuestion) string {
+func codexQuestionForAnswerKey(key string, questions []codexsdk.AskUserQuestion) (codexsdk.AskUserQuestion, bool) {
 	if strings.HasPrefix(key, "q_") {
 		indexText := strings.TrimPrefix(key, "q_")
 		for index, question := range questions {
 			if indexText == strconv.Itoa(index) {
-				return strings.TrimSpace(question.ID)
+				return question, true
 			}
 		}
 	}
 	for _, question := range questions {
 		if key == strings.TrimSpace(question.ID) {
-			return key
+			return question, true
 		}
 	}
-	return ""
+	return codexsdk.AskUserQuestion{}, false
+}
+
+// The web UI submits one comma-separated string per question. Split entries
+// that match option labels into separate answers and keep the remaining text
+// as the freeform answer.
+func codexAskUserAnswerValues(question codexsdk.AskUserQuestion, value string) []string {
+	labels := make(map[string]struct{}, len(question.Options))
+	for _, option := range question.Options {
+		label := strings.TrimSpace(option.Label)
+		if label != "" {
+			labels[label] = struct{}{}
+		}
+	}
+	var selected []string
+	var custom []string
+	for _, part := range strings.Split(value, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		if _, ok := labels[part]; ok {
+			selected = append(selected, part)
+		} else {
+			custom = append(custom, part)
+		}
+	}
+	if len(custom) > 0 {
+		selected = append(selected, strings.Join(custom, ", "))
+	}
+	if len(selected) == 0 {
+		return []string{value}
+	}
+	return selected
 }
 
 func (s *session) CurrentModel() string {
@@ -862,6 +900,10 @@ func (s *session) emit(event types.Event) {
 	if handler == nil {
 		return
 	}
+	// Turn-scoped update state is not concurrency-safe; ask-user requests are
+	// delivered from the app-server handler while the turn loop emits events.
+	s.emitMu.Lock()
+	defer s.emitMu.Unlock()
 	handler(event)
 }
 
@@ -1003,8 +1045,16 @@ func (s *session) handleRawEvent(event *codexsdk.RawEvent) bool {
 			return false
 		}
 		s.mu.Lock()
+		changed := s.contextWindow != usage
 		s.contextWindow = usage
 		s.mu.Unlock()
+		if changed && usage.TotalTokens > 0 && usage.ModelContextWindow > 0 {
+			s.emit(types.Event{
+				Type:      types.EventTypeContextUpdate,
+				SessionID: s.SessionID(),
+				Data:      types.ContextUpdate{ContextWindow: usage},
+			})
+		}
 		return true
 	case "item.plan.delta":
 		plan, ok := parsePlanDelta(event.Raw)

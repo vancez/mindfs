@@ -1,4 +1,5 @@
 import React from "react";
+import { useI18n } from "../i18n";
 import type { GitDiffPayload } from "../services/git";
 import { rootBadgeStyle } from "./rootBadgeStyle";
 import {
@@ -8,6 +9,7 @@ import {
   getInlineDiffSegments,
   type DiffLine,
 } from "./gitDiffModel";
+import { languageForPath, renderHighlightedCode } from "./codeHighlight";
 
 type GitDiffViewerProps = {
   diff: GitDiffPayload;
@@ -148,10 +150,20 @@ function inlineSegmentBackground(kind: DiffLine["kind"], segmentKind: "ctx" | "a
   return "transparent";
 }
 
-function renderDiffLineContent(line: DiffLine, counterpart?: DiffLine, includePrefix = true): React.ReactNode {
+function renderDiffLineContent(
+  line: DiffLine,
+  counterpart?: DiffLine,
+  includePrefix = true,
+  language?: string,
+): React.ReactNode {
   const prefix = line.kind === "add" ? "+" : line.kind === "del" ? "-" : " ";
   if (!counterpart || line.kind === "ctx" || counterpart.kind === "ctx") {
-    return `${includePrefix ? prefix : ""}${line.text || " "}`;
+    return (
+      <>
+        {includePrefix ? <span>{prefix}</span> : null}
+        {renderHighlightedCode(line.text || " ", language)}
+      </>
+    );
   }
 
   const oldText = line.kind === "del" ? line.text : counterpart.text;
@@ -171,10 +183,10 @@ function renderDiffLineContent(line: DiffLine, counterpart?: DiffLine, includePr
               borderRadius: segment.kind === "ctx" ? 0 : "3px",
             }}
           >
-            {segment.text}
+            {renderHighlightedCode(segment.text || " ", language)}
           </span>
         ))
-        : <span>{line.text || " "}</span>}
+        : renderHighlightedCode(line.text || " ", language)}
     </>
   );
 }
@@ -218,12 +230,24 @@ function normalizeRelatedSessions(raw: unknown): RelatedSession[] {
   });
 }
 
-export function GitDiffViewer({ diff, root, sideBySide = false, onPathClick, onSessionClick, onSelectionChange }: GitDiffViewerProps) {
+export const GitDiffViewer = React.memo(function GitDiffViewer({ diff, root, sideBySide = false, onPathClick, onSessionClick, onSelectionChange }: GitDiffViewerProps) {
+  const { t } = useI18n();
+  const notice = diff.binary
+    ? t("svn.binaryDiff")
+    : diff.property_only
+      ? t("svn.propertyOnlyDiff")
+      : diff.property_changes
+        ? t("svn.propertyChangesOmitted")
+        : "";
   const lines = React.useMemo(() => buildDiffLines(diff.content), [diff.content]);
   const sideBySideRows = React.useMemo(() => buildSideBySideRows(lines), [lines]);
   const unifiedRows = React.useMemo(() => buildUnifiedRows(lines), [lines]);
   const relatedSessions = React.useMemo(() => normalizeRelatedSessions(diff.file_meta), [diff.file_meta]);
   const displayPath = diff.display_path || diff.path;
+  const diffLanguage = React.useMemo(
+    () => languageForPath(diff.path || displayPath),
+    [diff.path, displayPath],
+  );
   const contentRootRef = React.useRef<HTMLDivElement | null>(null);
   const [isMobile, setIsMobile] = React.useState(() => {
     if (typeof window === "undefined") return false;
@@ -378,6 +402,20 @@ export function GitDiffViewer({ diff, root, sideBySide = false, onPathClick, onS
         </div>
       </header>
 
+      {notice ? (
+        <div
+          style={{
+            padding: "8px 16px",
+            borderBottom: "1px solid var(--border-color)",
+            background: "rgba(245, 158, 11, 0.08)",
+            color: "var(--text-secondary)",
+            fontSize: "12px",
+          }}
+        >
+          {notice}
+        </div>
+      ) : null}
+
       <div style={{ flex: 1, minHeight: 0, overflow: "auto" }}>
         <div
           style={{
@@ -446,7 +484,7 @@ export function GitDiffViewer({ diff, root, sideBySide = false, onPathClick, onS
                             borderRight: "1px solid var(--border-color)",
                           }}
                         >
-                          {row.left ? renderDiffLineContent(row.left, row.right) : " "}
+                          {row.left ? renderDiffLineContent(row.left, row.right, true, diffLanguage) : " "}
                         </div>
                         <div
                           style={{
@@ -470,7 +508,7 @@ export function GitDiffViewer({ diff, root, sideBySide = false, onPathClick, onS
                             color: row.right ? lineColor(rightKind) : "var(--text-secondary)",
                           }}
                         >
-                          {row.right ? renderDiffLineContent(row.right, row.left) : " "}
+                          {row.right ? renderDiffLineContent(row.right, row.left, true, diffLanguage) : " "}
                         </div>
                       </div>
                     );
@@ -523,7 +561,7 @@ export function GitDiffViewer({ diff, root, sideBySide = false, onPathClick, onS
                           {line.kind === "add" ? "+" : line.kind === "del" ? "-" : line.kind === "ctx" ? " " : ""}
                         </div>
                         <div style={{ padding: "0 12px 0 4px", whiteSpace: "pre-wrap", wordBreak: "break-word" }}>
-                          {renderDiffLineContent(line, row.counterpart, false)}
+                          {renderDiffLineContent(line, row.counterpart, false, diffLanguage)}
                         </div>
                       </div>
                     );
@@ -536,4 +574,4 @@ export function GitDiffViewer({ diff, root, sideBySide = false, onPathClick, onS
       </div>
     </div>
   );
-}
+});

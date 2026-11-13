@@ -4,6 +4,7 @@ import assert from "node:assert/strict";
 import {
   classifySwipeIntent,
   drawerSwipeStartSide,
+  horizontalPanAvailable,
   swipeProgress,
   swipeRelease,
   clamp01,
@@ -19,12 +20,29 @@ import {
 
 // ---------- edgeSwipe ----------
 
-test("drawer start zones are inset from system edges on both sides", () => {
-  for (const x of [0, 12, 23, 57, 196, 336, 370, 381, 393]) {
+test("drawer start zones include the natural screen edge on both sides", () => {
+  for (const x of [0, 6, 24, 40, 56]) assert.equal(drawerSwipeStartSide(x, 393), "left", `left edge: ${x}`);
+  for (const x of [337, 369, 381, 387, 393]) {
+    assert.equal(drawerSwipeStartSide(x, 393), "right", `right edge: ${x}`);
+  }
+  for (const x of [57, 120, 196, 336]) {
     assert.equal(drawerSwipeStartSide(x, 393), null, `outside zone: ${x}`);
   }
-  for (const x of [24, 40, 56]) assert.equal(drawerSwipeStartSide(x, 393), "left");
-  for (const x of [337, 353, 369]) assert.equal(drawerSwipeStartSide(x, 393), "right");
+});
+
+test("horizontalPanAvailable: a scroller keeps the pan only while it can move", () => {
+  const scroller = { scrollLeft: 0, scrollWidth: 600, clientWidth: 300 };
+  assert.equal(horizontalPanAvailable(scroller, -30), true, "unscrolled: leftward pan advances");
+  assert.equal(horizontalPanAvailable(scroller, 30), false, "unscrolled: rightward pan has no room");
+  const middle = { scrollLeft: 150, scrollWidth: 600, clientWidth: 300 };
+  assert.equal(horizontalPanAvailable(middle, -30), true);
+  assert.equal(horizontalPanAvailable(middle, 30), true);
+  const end = { scrollLeft: 300, scrollWidth: 600, clientWidth: 300 };
+  assert.equal(horizontalPanAvailable(end, -30), false, "at the end: leftward pan has no room");
+  assert.equal(horizontalPanAvailable(end, 30), true);
+  const notScrollable = { scrollLeft: 0, scrollWidth: 300, clientWidth: 300 };
+  assert.equal(horizontalPanAvailable(notScrollable, -30), false);
+  assert.equal(horizontalPanAvailable(notScrollable, 30), false);
 });
 
 test("classifySwipeIntent: dead zone keeps intent open", () => {

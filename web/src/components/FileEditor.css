@@ -30,14 +30,6 @@
   min-height: 0;
   min-width: 0;
   overflow: hidden;
-  --file-code-comment: #64748b;
-  --file-code-keyword: #7c3aed;
-  --file-code-string: #16703a;
-  --file-code-number: #b45309;
-  --file-code-type: #0e7490;
-  --file-code-function: #1d4ed8;
-  --file-code-property: #9d174d;
-  --file-code-invalid: #dc2626;
 }
 .file-code-editor .cm-editor { height: 100%; color: var(--text-primary); background: var(--panel-bg, transparent); }
 .file-code-editor .cm-editor.cm-focused { outline: none; }
@@ -53,28 +45,6 @@
 .file-code-editor .cm-selectionMatch { background: var(--selection-bg); }
 .file-code-editor .cm-matchingBracket { background: var(--selection-bg); outline: 1px solid var(--accent-color); }
 .file-editor-language-notice { padding: 8px 16px; color: var(--text-secondary); font-size: 12px; }
-:root[data-theme="dark"] .file-code-editor {
-  --file-code-comment: #94a3b8;
-  --file-code-keyword: #c4b5fd;
-  --file-code-string: #86efac;
-  --file-code-number: #fcd34d;
-  --file-code-type: #67e8f9;
-  --file-code-function: #93c5fd;
-  --file-code-property: #f9a8d4;
-  --file-code-invalid: #fca5a5;
-}
-@media (prefers-color-scheme: dark) {
-  :root:not([data-theme]) .file-code-editor {
-    --file-code-comment: #94a3b8;
-    --file-code-keyword: #c4b5fd;
-    --file-code-string: #86efac;
-    --file-code-number: #fcd34d;
-    --file-code-type: #67e8f9;
-    --file-code-function: #93c5fd;
-    --file-code-property: #f9a8d4;
-    --file-code-invalid: #fca5a5;
-  }
-}
 @media (max-width: 768px) {
   .file-code-editor .cm-lineNumbers .cm-gutterElement { padding-left: 8px; padding-right: 8px; }
 }

@@ -4,18 +4,45 @@ export type SwipeDragMode = "open" | "close";
 
 export type SwipeIntent = "horizontal" | "vertical" | null;
 
-// Leave the outer edge to Android's back gesture; listen without covering controls.
-const DRAWER_SWIPE_INSET = 24;
-const DRAWER_SWIPE_WIDTH = 32;
+// The hot zone starts at the screen edge: an installed iOS PWA has no browser
+// back gesture to defer to, and platform back gestures (Android, Safari tabs)
+// win the touch stream themselves — a dead band at the edge only makes the
+// drawer feel broken. Wide enough to grab without aiming.
+const DRAWER_SWIPE_MAX_START = 56;
 
 export function drawerSwipeStartSide(x: number, viewportWidth: number): SidebarSide | null {
   const leftDistance = x;
   const rightDistance = viewportWidth - x;
-  const inZone = (distance: number) =>
-    distance >= DRAWER_SWIPE_INSET && distance <= DRAWER_SWIPE_INSET + DRAWER_SWIPE_WIDTH;
+  const inZone = (distance: number) => distance >= 0 && distance <= DRAWER_SWIPE_MAX_START;
   if (inZone(leftDistance)) return "left";
   if (inZone(rightDistance)) return "right";
   return null;
+}
+
+export type HorizontalScrollState = {
+  scrollLeft: number;
+  scrollWidth: number;
+  clientWidth: number;
+};
+
+/**
+ * Whether a horizontal scroller can still follow a pan in the finger direction
+ * (`dx` < 0 = finger moves left, content advances). An inner scroller only
+ * keeps the gesture while it has room left to move; otherwise the pan belongs
+ * to the drawer.
+ */
+export function horizontalPanAvailable(scroller: HorizontalScrollState, dx: number): boolean {
+  const maxScrollLeft = scroller.scrollWidth - scroller.clientWidth;
+  if (maxScrollLeft <= 0) {
+    return false;
+  }
+  if (dx < 0) {
+    return scroller.scrollLeft < maxScrollLeft - 1;
+  }
+  if (dx > 0) {
+    return scroller.scrollLeft > 1;
+  }
+  return false;
 }
 
 /**

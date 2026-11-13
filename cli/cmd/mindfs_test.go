@@ -38,6 +38,27 @@ func TestNormalizeTaskGroupRootFirstArgs(t *testing.T) {
 	}
 }
 
+func TestShouldOpenBrowser(t *testing.T) {
+	tests := []struct {
+		name           string
+		noBrowser      bool
+		internalLaunch bool
+		want           bool
+	}{
+		{name: "default", want: true},
+		{name: "no-browser", noBrowser: true, want: false},
+		{name: "internal autostart", internalLaunch: true, want: false},
+		{name: "both", noBrowser: true, internalLaunch: true, want: false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := shouldOpenBrowser(test.noBrowser, test.internalLaunch); got != test.want {
+				t.Fatalf("shouldOpenBrowser(%v, %v) = %v, want %v", test.noBrowser, test.internalLaunch, got, test.want)
+			}
+		})
+	}
+}
+
 func TestWaitForForegroundAppExitWaitsForCleanupAfterCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()

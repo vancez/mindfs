@@ -3,11 +3,13 @@ package api
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -48,12 +50,15 @@ func TestFileEditingHTTPAndEncryption(t *testing.T) {
 			}
 			handler := (&HTTPHandler{AppContext: app}).Routes()
 			target := "/api/file?" + url.Values{"root": {root.ID}, "path": {"notes.txt"}}.Encode()
+			var nonceSeq atomic.Uint64
 			request := func(method, target string, payload any, authorized bool) (int, map[string]json.RawMessage) {
 				t.Helper()
 				var body []byte
+				nonce := ""
 				if payload != nil {
 					if encrypted && authorized {
-						envelope, err := e2ee.EncryptJSON(key, payload)
+						nonce = fmt.Sprintf("testnonce%010d", nonceSeq.Add(1))
+						envelope, err := e2ee.EncryptJSONWithAAD(key, e2ee.RequestEnvelopeAAD(method, target, nonce), payload)
 						if err != nil {
 							t.Fatal(err)
 						}
@@ -66,10 +71,14 @@ func TestFileEditingHTTPAndEncryption(t *testing.T) {
 				req.Header.Set("Content-Type", "application/json")
 				if encrypted && authorized {
 					ts := time.Now().UTC().Format(time.RFC3339)
+					if nonce == "" {
+						nonce = fmt.Sprintf("testnonce%010d", nonceSeq.Add(1))
+					}
 					req.Header.Set(e2eeHeaderName, "1")
 					req.Header.Set(clientIDHeaderName, "test-client")
 					req.Header.Set(e2eeTSHeaderName, ts)
-					req.Header.Set(e2eeProofHeaderName, e2ee.BuildRequestProof(key, method, target, ts, "test-client"))
+					req.Header.Set(e2eeNonceHeaderName, nonce)
+					req.Header.Set(e2eeProofHeaderName, e2ee.BuildRequestProof(key, method, target, ts, nonce, "test-client"))
 				}
 				response := httptest.NewRecorder()
 				handler.ServeHTTP(response, req)
@@ -79,7 +88,7 @@ func TestFileEditingHTTPAndEncryption(t *testing.T) {
 					if err := json.Unmarshal(response.Body.Bytes(), &envelope); err != nil {
 						t.Fatal(err)
 					}
-					if err := e2ee.DecryptJSON(key, &envelope, &result); err != nil {
+					if err := e2ee.DecryptJSONWithAAD(key, e2ee.ResponseEnvelopeAAD(method, target, nonce), &envelope, &result); err != nil {
 						t.Fatal(err)
 					}
 				} else if err := json.Unmarshal(response.Body.Bytes(), &result); err != nil {

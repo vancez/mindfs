@@ -23,6 +23,7 @@ type Manager struct {
 	cfg       Config
 	sessions  map[string]*Session
 	clientIDs map[string]string
+	nonces    *nonceCache
 }
 
 func NewManager(cfg Config) *Manager {
@@ -30,7 +31,24 @@ func NewManager(cfg Config) *Manager {
 		cfg:       cfg,
 		sessions:  map[string]*Session{},
 		clientIDs: map[string]string{},
+		nonces:    newNonceCache(defaultNonceLimit),
 	}
+}
+
+// ConsumeRequestNonce records a proof nonce and reports whether it was unused.
+// Callers must verify the request proof before consuming the nonce.
+func (m *Manager) ConsumeRequestNonce(sessionID, nonce string) bool {
+	if m == nil || m.nonces == nil {
+		return false
+	}
+	return m.nonces.consumeAt(sessionID, nonce, time.Now())
+}
+
+func (m *Manager) consumeRequestNonceAt(sessionID, nonce string, now time.Time) bool {
+	if m == nil || m.nonces == nil {
+		return false
+	}
+	return m.nonces.consumeAt(sessionID, nonce, now)
 }
 
 func (m *Manager) Enabled() bool {
@@ -115,6 +133,10 @@ func (m *Manager) CleanupExpired() {
 			m.removeSessionLocked(id)
 			m.clearClientBindingLocked(id)
 		}
+	}
+	now := time.Now().UTC()
+	if m.nonces != nil {
+		m.nonces.prune(now)
 	}
 }
 

@@ -30,6 +30,7 @@ const (
 	wsPongWait              = 2 * time.Minute
 	wsProofQuery            = "e2ee_proof"
 	wsTSQuery               = "e2ee_ts"
+	wsNonceQuery            = "e2ee_nonce"
 	wsCloseClientSuperseded = 4000
 
 	sessionDoneSettleWindow = 50 * time.Millisecond
@@ -239,17 +240,17 @@ func (h *WSHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			sess, err := e2eeManager.SessionForClient(clientID)
 			if err != nil {
 				h.sendE2EEError(conn, "", err.Error())
-				continue
+				return
 			}
 			var envelope e2ee.CipherEnvelope
 			if err := json.Unmarshal(message, &envelope); err != nil {
 				h.sendE2EEError(conn, "", "e2ee_session_missing")
-				continue
+				return
 			}
-			message, err = e2ee.DecryptBytes(sess.Key, &envelope)
+			message, err = h.AppContext.GetSessionStreamHub().DecryptWSMessage(conn, sess.Key, &envelope)
 			if err != nil {
 				h.sendE2EEError(conn, "", "e2ee_proof_invalid")
-				continue
+				return
 			}
 		}
 		var req WSRequest
@@ -271,8 +272,12 @@ func (h *WSHandler) requireWSProof(r *http.Request, clientID string) error {
 	}
 	ts := strings.TrimSpace(r.URL.Query().Get(wsTSQuery))
 	proof := strings.TrimSpace(r.URL.Query().Get(wsProofQuery))
+	nonce := strings.TrimSpace(r.URL.Query().Get(wsNonceQuery))
 	if clientID == "" || ts == "" || proof == "" {
 		return errInvalidRequest("e2ee_proof_required")
+	}
+	if !e2ee.ValidRequestNonce(nonce) {
+		return errInvalidRequest("e2ee_nonce_required")
 	}
 	sess, err := manager.SessionForClient(clientID)
 	if err != nil {
@@ -286,9 +291,12 @@ func (h *WSHandler) requireWSProof(r *http.Request, clientID string) error {
 	if timestamp.Before(now.Add(-requestProofMaxSkew)) || timestamp.After(now.Add(requestProofMaxSkew)) {
 		return errInvalidRequest("e2ee_proof_expired")
 	}
-	expected := e2ee.BuildRequestProof(sess.Key, r.Method, wsProofPath(r), ts, clientID)
+	expected := e2ee.BuildRequestProof(sess.Key, r.Method, wsProofPath(r), ts, nonce, clientID)
 	if !e2ee.VerifyProof(expected, proof) {
 		return errInvalidRequest("e2ee_proof_invalid")
+	}
+	if !manager.ConsumeRequestNonce(sess.ID, nonce) {
+		return errInvalidRequest("e2ee_proof_replayed")
 	}
 	return nil
 }
@@ -301,6 +309,7 @@ func wsProofPath(r *http.Request) string {
 	query := cloneQuery(next.Query())
 	query.Del(wsTSQuery)
 	query.Del(wsProofQuery)
+	query.Del(wsNonceQuery)
 	next.RawQuery = query.Encode()
 	if next.RawQuery == "" {
 		return next.Path
@@ -377,6 +386,10 @@ func (h *WSHandler) broadcastSessionMetaUpdated(rootID string, sess *session.Ses
 		h.broadcastWS(WSResponse{Type: "session.meta.updated"})
 		return
 	}
+	pending := false
+	if h.AppContext != nil {
+		pending = h.AppContext.GetSessionStreamHub().SessionPending(sess.Key)
+	}
 	resp := WSResponse{
 		Type: "session.meta.updated",
 		Payload: map[string]any{
@@ -396,6 +409,7 @@ func (h *WSHandler) broadcastSessionMetaUpdated(rootID string, sess *session.Ses
 				"plan_mode":           sess.PlanMode,
 				"related_worktree":    sess.RelatedWorktree,
 				"pinned_at":           sess.PinnedAt,
+				"pending":             pending,
 				"updated_at":          sess.UpdatedAt,
 			},
 		},
@@ -484,6 +498,8 @@ func (h *WSHandler) handleWSRequest(ctx context.Context, conn *websocket.Conn, c
 	switch req.Type {
 	case "ping":
 		h.handleWSPing(conn, clientID, req)
+	case "client.focus":
+		h.handleClientFocus(clientID, req)
 	case "session.message":
 		go h.handleSessionMessage(ctx, conn, clientID, req)
 	case "session.slash_command.run":
@@ -533,7 +549,11 @@ func (h *WSHandler) handleSessionAnswerQuestion(ctx context.Context, conn *webso
 		return
 	}
 	if manager, err := h.AppContext.GetSessionManager(rootID); err == nil {
-		if sess, getErr := manager.Get(ctx, key, 0); getErr == nil && sess != nil && strings.TrimSpace(sess.TaskID) != "" {
+		if toolCall, getErr := manager.GetFullToolCall(ctx, key, toolUseID); getErr == nil && toolCall != nil {
+			// Broadcast the answered state immediately so other viewers close
+			// the question card without waiting for the agent's next update.
+			h.AppContext.BroadcastSessionUpdate(rootID, key, agenttypes.Event{Type: agenttypes.EventTypeToolUpdate, Data: *toolCall})
+		} else if sess, getErr := manager.Get(ctx, key, 0); getErr == nil && sess != nil && strings.TrimSpace(sess.TaskID) != "" {
 			if svc, svcErr := h.AppContext.GetKanbanService(); svcErr == nil {
 				value := false
 				if _, clearErr := svc.UpdateTaskAuxFlags(ctx, rootID, sess.TaskID, kanban.TaskAuxFlagsPatch{AskUserWaiting: &value}, "aux_ask_user_answered"); clearErr != nil {
@@ -543,9 +563,14 @@ func (h *WSHandler) handleSessionAnswerQuestion(ctx context.Context, conn *webso
 		}
 	}
 	_ = h.writeWSJSON(clientID, conn, WSResponse{
-		ID:      req.ID,
-		Type:    "session.answer_question.accepted",
-		Payload: map[string]any{"root_id": rootID, "session_key": key, "tool_use_id": toolUseID},
+		ID:   req.ID,
+		Type: "session.answer_question.accepted",
+		Payload: map[string]any{
+			"root_id":     rootID,
+			"session_key": key,
+			"tool_use_id": toolUseID,
+			"request_id":  req.ID,
+		},
 	})
 }
 
@@ -556,6 +581,13 @@ func (h *WSHandler) handleWSPing(conn *websocket.Conn, clientID string, req WSRe
 		Payload: map[string]any{"ts": time.Now().UTC().Format(time.RFC3339Nano)},
 	}
 	_ = h.writeWSJSON(clientID, conn, resp)
+}
+
+func (h *WSHandler) handleClientFocus(clientID string, req WSRequest) {
+	if h == nil || h.AppContext == nil {
+		return
+	}
+	h.AppContext.GetSessionStreamHub().SetClientFocused(clientID, getBool(req.Payload, "focused"))
 }
 
 func (h *WSHandler) handleSessionMessage(ctx context.Context, conn *websocket.Conn, clientID string, req WSRequest) {
@@ -947,10 +979,10 @@ func (h *WSHandler) runSessionMessage(job sessionMessageJob) {
 			h.AppContext.BroadcastAgentStatusChanged(agentName)
 		},
 		OnSubSessionCreated: func(created *session.Session) {
-			h.broadcastSessionMetaUpdated(rootID, created)
 			if created != nil {
 				streamHub.SetPendingReply(rootID, created.Key, created.Name)
 			}
+			h.broadcastSessionMetaUpdated(rootID, created)
 		},
 		OnSubSessionUpdate: func(sessionKey string, update agenttypes.Event) {
 			if !acceptUpdates.Load() {
@@ -968,7 +1000,7 @@ func (h *WSHandler) runSessionMessage(job sessionMessageJob) {
 				if ok := tracker.WaitIdle(msgCtx, sessionDoneSettleWindow, sessionDoneMaxWait); !ok {
 					log.Printf("[ws] sub-session.done.wait_timeout root=%s session=%s", rootID, sessionKey)
 				}
-				h.AppContext.BroadcastSessionDone(rootID, sessionKey, "")
+				h.AppContext.BroadcastSubSessionDone(rootID, sessionKey)
 				return
 			}
 			tracker.End()
@@ -1246,6 +1278,10 @@ func updateToEvent(update agenttypes.Event) *StreamEvent {
 		if todo, ok := update.Data.(agenttypes.TodoUpdate); ok {
 			return &StreamEvent{Type: "todo_update", Data: todo}
 		}
+	case agenttypes.EventTypeTaskUpdate:
+		if tasks, ok := update.Data.(agenttypes.TaskListUpdate); ok {
+			return &StreamEvent{Type: "task_update", Data: tasks}
+		}
 	case agenttypes.EventTypePlanUpdate:
 		if plan, ok := update.Data.(agenttypes.PlanUpdate); ok {
 			return &StreamEvent{Type: "plan_update", Data: plan}
@@ -1263,6 +1299,11 @@ func updateToEvent(update agenttypes.Event) *StreamEvent {
 			return &StreamEvent{Type: "message_done", Data: done}
 		}
 		return &StreamEvent{Type: "message_done", Data: agenttypes.MessageDone{}}
+	case agenttypes.EventTypeContextUpdate:
+		if contextUpdate, ok := update.Data.(agenttypes.ContextUpdate); ok {
+			return &StreamEvent{Type: "context_update", Data: contextUpdate}
+		}
+		return nil
 	case agenttypes.EventTypeRecovery:
 		if recovery, ok := update.Data.(agenttypes.RecoveryStatus); ok {
 			return &StreamEvent{Type: "recovery", Data: recovery}

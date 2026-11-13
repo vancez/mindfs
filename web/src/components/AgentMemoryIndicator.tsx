@@ -20,9 +20,10 @@ function formatBytes(value: number): string {
 
 type Props = {
   refreshToken?: number;
+  compact?: boolean;
 };
 
-export function AgentMemoryIndicator({ refreshToken = 0 }: Props) {
+export function AgentMemoryIndicator({ refreshToken = 0, compact = false }: Props) {
   const { t } = useI18n();
   const [snapshot, setSnapshot] = useState<AgentMemorySnapshot | null>(null);
   const [open, setOpen] = useState(false);
@@ -206,7 +207,8 @@ export function AgentMemoryIndicator({ refreshToken = 0 }: Props) {
           cursor: "pointer",
         }}
       >
-        {t("agentMemory.badge")} {loading && !snapshot ? "··" : snapshot ? formatBytes(snapshot.total_memory_bytes) : "—"}
+        {compact ? null : `${t("agentMemory.badge")} `}
+        {loading && !snapshot ? "··" : snapshot ? formatBytes(snapshot.total_memory_bytes) : "—"}
       </button>
       {modal}
     </>

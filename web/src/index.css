@@ -4,8 +4,9 @@
 
 :root {
   color-scheme: light;
-  --mindfs-safe-area-top: 0px;
-  --mindfs-safe-area-bottom: 0px;
+  /* Native shells override these via inline styles on <html>; web/PWA uses env() */
+  --mindfs-safe-area-top: env(safe-area-inset-top, 0px);
+  --mindfs-safe-area-bottom: env(safe-area-inset-bottom, 0px);
   --mindfs-ime-bottom: 0px;
   --mindfs-viewport-height: 100dvh;
   --mindfs-viewport-offset-top: 0px;
@@ -80,6 +81,28 @@
 .mindfs-font-scale-region .markdown-outline-item,
 .mindfs-font-scale-region .mindfs-git-branch-wrap[data-branch-tooltip]::after {
   font-size: calc(12px * var(--mindfs-font-scale, 1));
+}
+
+/*
+ * iOS Safari zooms the whole page when a text control below 16px receives
+ * focus, which leaves the UI looking enlarged after the keyboard closes.
+ * Keep text entry at 16px or more on WebKit/iOS only, while still following
+ * larger region font preferences: `-webkit-touch-callout` is not supported by
+ * Chromium, so Android/desktop layouts are unaffected. The region-scoped
+ * `[style]` variants are needed because the font preferences scale inline
+ * font sizes with a more specific !important rule.
+ */
+@supports (-webkit-touch-callout: none) {
+  input:not([type="checkbox"]):not([type="radio"]),
+  textarea,
+  select,
+  [contenteditable="true"],
+  .mindfs-font-scale-region input[style],
+  .mindfs-font-scale-region textarea[style],
+  .mindfs-font-scale-region select[style],
+  .mindfs-font-scale-region [contenteditable="true"][style] {
+    font-size: max(16px, 1em) !important;
+  }
 }
 
 .mindfs-font-size-adjust:disabled {
@@ -238,6 +261,10 @@ html {
   overflow-x: hidden;
   overflow-y: hidden;
   overscroll-behavior: none;
+  /* Do not let mobile browsers inflate text on their own (font boosting /
+     rotation auto-sizing); sizing is controlled by the font preferences. */
+  -webkit-text-size-adjust: 100%;
+  text-size-adjust: 100%;
 }
 
 @media (prefers-color-scheme: dark) {
@@ -749,6 +776,7 @@ body {
   border-radius: 999px;
 }
 
+/* Keep in sync with MOBILE_LAYOUT_QUERY in services/viewport.ts. */
 @media (max-width: 767px) {
   html,
   body {

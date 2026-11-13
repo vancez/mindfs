@@ -401,6 +401,37 @@ func TestManagerPersistsLastContextWindow(t *testing.T) {
 	}
 }
 
+func TestManagerPersistsUsedOnlyLastContextWindow(t *testing.T) {
+	root := rootfs.NewRootInfo("mindfs", "mindfs", t.TempDir())
+	manager := NewManager(root)
+
+	created, err := manager.Create(context.Background(), CreateInput{
+		Type:  TypeChat,
+		Agent: "claude",
+		Name:  "subagent",
+	})
+	if err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+
+	want := agenttypes.ContextWindow{TotalTokens: 777}
+	if err := manager.UpdateLastContextWindow(context.Background(), created, want); err != nil {
+		t.Fatalf("update context window: %v", err)
+	}
+	if err := manager.UpdateLastContextWindow(context.Background(), created, agenttypes.ContextWindow{}); err != nil {
+		t.Fatalf("empty context window should be ignored: %v", err)
+	}
+	manager.sessions = map[string]*Session{}
+
+	loaded, err := manager.Get(context.Background(), created.Key, 0)
+	if err != nil {
+		t.Fatalf("get session: %v", err)
+	}
+	if loaded.LastContextWindow != want {
+		t.Fatalf("LastContextWindow = %#v, want %#v", loaded.LastContextWindow, want)
+	}
+}
+
 func TestManagerStoresFullToolCallAndReturnsCompactedAux(t *testing.T) {
 	root := rootfs.NewRootInfo("mindfs", "mindfs", t.TempDir())
 	manager := NewManager(root)
@@ -538,6 +569,40 @@ func TestManagerStoresTodoAux(t *testing.T) {
 	}
 	if got := aux[2][0].Todo.Items[0].Content; got != "persist todos" {
 		t.Fatalf("todo content = %q, want persist todos", got)
+	}
+}
+
+func TestManagerStoresTaskListAux(t *testing.T) {
+	root := rootfs.NewRootInfo("mindfs", "mindfs", t.TempDir())
+	manager := NewManager(root)
+
+	created, err := manager.Create(context.Background(), CreateInput{
+		Type: TypeChat,
+		Name: "Chat",
+	})
+	if err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+
+	if err := manager.AddExchangeAux(context.Background(), created.Key, ExchangeAux{
+		Seq:  2,
+		Line: 0,
+		Tasks: &agenttypes.TaskListUpdate{
+			Items: []agenttypes.TaskItem{{ID: "7", Subject: "persist tasks", Status: "running"}},
+		},
+	}); err != nil {
+		t.Fatalf("add tasks aux: %v", err)
+	}
+
+	aux, err := manager.GetExchangeAux(context.Background(), created.Key, 0)
+	if err != nil {
+		t.Fatalf("get aux: %v", err)
+	}
+	if len(aux[2]) != 1 || aux[2][0].Tasks == nil {
+		t.Fatalf("aux[2] = %#v, want tasks aux", aux[2])
+	}
+	if got := aux[2][0].Tasks.Items[0].Subject; got != "persist tasks" {
+		t.Fatalf("task subject = %q, want persist tasks", got)
 	}
 }
 

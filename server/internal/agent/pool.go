@@ -367,6 +367,7 @@ func (p *Pool) openSession(ctx context.Context, protocol Protocol, def Definitio
 			ResumeSessionID:       in.AgentSessionID,
 			ForkSessionID:         in.ForkPoint.AgentSessionID,
 			ResumeMessageID:       in.ForkPoint.ClaudeMessageUUID,
+			InitialTaskList:       in.InitialTaskList,
 		})
 	case ProtocolCodexSDK:
 		var codexUserOrdinal *int

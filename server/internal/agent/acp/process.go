@@ -188,14 +188,16 @@ func (s *sessionState) getContextWindow() types.ContextWindow {
 	return s.contextWindow
 }
 
-func (s *sessionState) setUsageUpdate(used, size int) {
+func (s *sessionState) setUsageUpdate(used, size int) bool {
 	s.mu.Lock()
+	defer s.mu.Unlock()
+	previous := s.contextWindow
 	if size > 0 {
 		s.contextWindow.ModelContextWindow = size
 	}
 	s.contextWindow.TotalTokens = max(0, used)
 	s.contextUsageUpdateSeen = true
-	s.mu.Unlock()
+	return s.contextWindow != previous
 }
 
 func (s *sessionState) hasContextUsageUpdate() bool {
@@ -270,13 +272,14 @@ type SessionUpdate struct {
 type UpdateType string
 
 const (
-	UpdateTypeMessageChunk UpdateType = "message_chunk"
-	UpdateTypeUserMessage  UpdateType = "user_message_chunk"
-	UpdateTypeThoughtChunk UpdateType = "thought_chunk"
-	UpdateTypeToolCall     UpdateType = "tool_call"
-	UpdateTypeToolUpdate   UpdateType = "tool_update"
-	UpdateTypePlan         UpdateType = "plan_update"
-	UpdateTypeMessageDone  UpdateType = "message_done"
+	UpdateTypeMessageChunk  UpdateType = "message_chunk"
+	UpdateTypeUserMessage   UpdateType = "user_message_chunk"
+	UpdateTypeContextUpdate UpdateType = "context_update"
+	UpdateTypeThoughtChunk  UpdateType = "thought_chunk"
+	UpdateTypeToolCall      UpdateType = "tool_call"
+	UpdateTypeToolUpdate    UpdateType = "tool_update"
+	UpdateTypePlan          UpdateType = "plan_update"
+	UpdateTypeMessageDone   UpdateType = "message_done"
 )
 
 // mindfsClient implements acp.Client interface
@@ -333,10 +336,15 @@ func (c *mindfsClient) SessionUpdate(ctx context.Context, params acp.SessionNoti
 		c.proc.mu.Unlock()
 	}
 	if params.Update.UsageUpdate != nil {
-		session.setUsageUpdate(
+		if session.setUsageUpdate(
 			params.Update.UsageUpdate.Used,
 			params.Update.UsageUpdate.Size,
-		)
+		) {
+			handler(SessionUpdate{
+				Type:      UpdateTypeContextUpdate,
+				SessionID: string(params.SessionId),
+			})
+		}
 	}
 
 	if internalUpdate.Type != "" {

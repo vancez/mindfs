@@ -281,6 +281,96 @@ func TestNormalizeSessionRelatedFilesResolvesLegacyTaskWorktreePath(t *testing.T
 	}
 }
 
+func TestSvnUsecases(t *testing.T) {
+	if _, err := exec.LookPath("svn"); err != nil {
+		t.Skip("svn not found")
+	}
+	if _, err := exec.LookPath("svnadmin"); err != nil {
+		t.Skip("svnadmin not found")
+	}
+	baseDir := t.TempDir()
+	repoDir := filepath.Join(baseDir, "repo")
+	rootDir := filepath.Join(baseDir, "wc")
+	runUsecaseSVNCommand(t, "", "svnadmin", "create", repoDir)
+	runUsecaseSVNCommand(t, "", "svn", "--non-interactive", "checkout", "-q", usecaseFileURL(repoDir), rootDir)
+	mustWriteFile(t, filepath.Join(rootDir, "note.txt"), "base\n")
+	runUsecaseSVNCommand(t, rootDir, "svn", "--non-interactive", "add", "note.txt")
+	runUsecaseSVNCommand(t, rootDir, "svn", "--non-interactive", "commit", "-q", "-m", "r1")
+	mustWriteFile(t, filepath.Join(rootDir, "note.txt"), "changed\n")
+
+	root := rootfs.NewRootInfo("mindfs", "mindfs", rootDir)
+	service := Service{Registry: uploadTestRegistry{root: root}}
+
+	status, err := service.GetSvnStatus(context.Background(), SvnStatusInput{RootID: root.ID})
+	if err != nil {
+		t.Fatalf("GetSvnStatus returned error: %v", err)
+	}
+	if len(status.Status.Items) != 1 || status.Status.Items[0].Status != "M" {
+		t.Fatalf("unexpected status: %+v", status.Status)
+	}
+
+	diff, err := service.GetSvnDiff(context.Background(), SvnDiffInput{RootID: root.ID, Path: "note.txt"})
+	if err != nil {
+		t.Fatalf("GetSvnDiff returned error: %v", err)
+	}
+	if !strings.Contains(diff.Diff.Content, "-base") || !strings.Contains(diff.Diff.Content, "+changed") {
+		t.Fatalf("unexpected diff content:\n%s", diff.Diff.Content)
+	}
+
+	related, err := service.GetSvnRelatedFileDiff(context.Background(), SvnRelatedFileDiffInput{
+		RootID:   root.ID,
+		RepoPath: rootDir,
+		Revision: "1",
+		Path:     "note.txt",
+	})
+	if err != nil {
+		t.Fatalf("GetSvnRelatedFileDiff returned error: %v", err)
+	}
+	if related.Diff.Source != "worktree" || related.Diff.Additions != 1 || related.Diff.Deletions != 1 {
+		t.Fatalf("unexpected related diff: %+v", related.Diff)
+	}
+
+	mustWriteFile(t, filepath.Join(rootDir, "new-note.txt"), "new\n")
+	committed, err := service.SvnCommit(context.Background(), SvnActionInput{
+		RootID:  root.ID,
+		Message: "subject line\n\nbody line",
+		Paths:   []string{"note.txt", "new-note.txt"},
+	})
+	if err != nil {
+		t.Fatalf("SvnCommit returned error: %v", err)
+	}
+	if len(committed.Status.Items) != 0 {
+		t.Fatalf("status after SvnCommit is not clean: %+v", committed.Status.Items)
+	}
+
+	updated, err := service.SvnUpdate(context.Background(), SvnActionInput{RootID: root.ID})
+	if err != nil {
+		t.Fatalf("SvnUpdate returned error: %v", err)
+	}
+	if len(updated.Status.Items) != 0 {
+		t.Fatalf("status after SvnUpdate is not clean: %+v", updated.Status.Items)
+	}
+
+	mustWriteFile(t, filepath.Join(rootDir, "note.txt"), "discard me\n")
+	reverted, err := service.SvnRevert(context.Background(), SvnRevertInput{
+		RootID: root.ID,
+		Path:   "note.txt",
+	})
+	if err != nil {
+		t.Fatalf("SvnRevert returned error: %v", err)
+	}
+	if len(reverted.Status.Items) != 0 {
+		t.Fatalf("status after SvnRevert is not clean: %+v", reverted.Status.Items)
+	}
+	content, err := os.ReadFile(filepath.Join(rootDir, "note.txt"))
+	if err != nil {
+		t.Fatalf("read reverted note.txt: %v", err)
+	}
+	if string(content) != "changed\n" {
+		t.Fatalf("reverted content = %q, want changed\\n", content)
+	}
+}
+
 func TestGetGitDiffUsesRepoPath(t *testing.T) {
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git not found")
@@ -606,7 +696,7 @@ func TestDeleteSessionDeletesSubSessionTree(t *testing.T) {
 		t.Fatalf("create sibling: %v", err)
 	}
 
-	if err := service.DeleteSession(ctx, DeleteSessionInput{RootID: root.ID, Key: parent.Key}); err != nil {
+	if _, err := service.DeleteSession(ctx, DeleteSessionInput{RootID: root.ID, Key: parent.Key}); err != nil {
 		t.Fatalf("delete parent: %v", err)
 	}
 	for _, deleted := range []*session.Session{parent, child, grandchild} {
@@ -646,7 +736,7 @@ func TestDeleteSessionKeepsChildrenAsIndependentSessions(t *testing.T) {
 		return []string{child.Key}, nil
 	}
 	service := Service{Registry: registry}
-	if err := service.DeleteSession(ctx, DeleteSessionInput{RootID: root.ID, Key: parent.Key, KeepChildren: true}); err != nil {
+	if _, err := service.DeleteSession(ctx, DeleteSessionInput{RootID: root.ID, Key: parent.Key, KeepChildren: true}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := manager.Get(ctx, parent.Key, 0); err == nil {
@@ -711,6 +801,119 @@ func TestSubSessionSyntheticDonePersistsPartialResponse(t *testing.T) {
 	}
 	if !sawDone {
 		t.Fatalf("synthetic done was not emitted")
+	}
+}
+
+func TestAttachBackgroundSessionUpdatesGroupsThoughtAcrossProgress(t *testing.T) {
+	ctx := context.Background()
+	rootDir := t.TempDir()
+	root := rootfs.NewRootInfo("mindfs", "mindfs", rootDir)
+	manager := session.NewManager(root)
+	child, err := manager.Create(ctx, session.CreateInput{Type: session.TypeChat, Agent: "claude", Name: "child"})
+	if err != nil {
+		t.Fatalf("create child: %v", err)
+	}
+	runtime := &fakeUsecaseAgentSession{id: "sub-thread"}
+	markDone := attachBackgroundSessionUpdates(ctx, subagentSessionInput{
+		RootID:      root.ID,
+		Agent:       "claude",
+		Mode:        "default",
+		Effort:      "medium",
+		FastService: "off",
+		Manager:     manager,
+	}, child, runtime)
+
+	runtime.emit(agenttypes.Event{Type: agenttypes.EventTypeThoughtChunk, Data: agenttypes.ThoughtChunk{Content: "first "}})
+	// Task progress heartbeats are not visible transcript boundaries.
+	runtime.emit(agenttypes.Event{Type: agenttypes.EventTypeToolUpdate, Data: agenttypes.ToolCall{
+		CallID:  "task-1",
+		Status:  "running",
+		Kind:    agenttypes.ToolKindTask,
+		RawType: "claude_task",
+		Meta:    map[string]any{"subtype": "task_progress"},
+	}})
+	runtime.emit(agenttypes.Event{Type: agenttypes.EventTypeThoughtChunk, Data: agenttypes.ThoughtChunk{Content: "second"}})
+	// A new tool card is a real boundary.
+	runtime.emit(agenttypes.Event{Type: agenttypes.EventTypeToolCall, Data: agenttypes.ToolCall{
+		CallID:  "tool-2",
+		Title:   "Read",
+		Status:  "running",
+		Kind:    agenttypes.ToolKindRead,
+		RawType: "tool_use",
+	}})
+	runtime.emit(agenttypes.Event{Type: agenttypes.EventTypeThoughtChunk, Data: agenttypes.ThoughtChunk{Content: "third"}})
+	markDone()
+
+	aux, err := manager.GetExchangeAux(ctx, child.Key, 0)
+	if err != nil {
+		t.Fatalf("get aux: %v", err)
+	}
+	thoughts := make([]string, 0, 2)
+	for _, items := range aux {
+		for _, item := range items {
+			if strings.TrimSpace(item.Thought) != "" {
+				thoughts = append(thoughts, item.Thought)
+			}
+		}
+	}
+	if len(thoughts) != 2 {
+		t.Fatalf("thought blocks = %#v, want 2", thoughts)
+	}
+	if thoughts[0] != "first second" || thoughts[1] != "third" {
+		t.Fatalf("thought blocks = %#v, want grouped across progress updates", thoughts)
+	}
+}
+
+func TestClaudeSubagentRouterRoutesThoughtChunkToChild(t *testing.T) {
+	ctx := context.Background()
+	rootDir := t.TempDir()
+	root := rootfs.NewRootInfo("mindfs", "mindfs", rootDir)
+	manager := session.NewManager(root)
+	parent, err := manager.Create(ctx, session.CreateInput{Type: session.TypeChat, Agent: "claude", Name: "parent"})
+	if err != nil {
+		t.Fatalf("create parent: %v", err)
+	}
+
+	var created *session.Session
+	router := newClaudeSubagentRouter(subagentSessionInput{
+		RootID:  root.ID,
+		Parent:  parent,
+		Agent:   "claude",
+		Manager: manager,
+		OnCreated: func(child *session.Session) {
+			created = child
+		},
+	})
+	if consumed := router.Handle(ctx, agenttypes.Event{
+		Type: agenttypes.EventTypeThoughtChunk,
+		Data: agenttypes.ThoughtChunk{Content: "child thought", ParentToolUseID: "tool-1"},
+	}); !consumed {
+		t.Fatal("subagent thought chunk was not consumed")
+	}
+	if created == nil {
+		t.Fatal("child session was not created from thought chunk")
+	}
+	if consumed := router.Handle(ctx, agenttypes.Event{
+		Type: agenttypes.EventTypeMessageDone,
+		Data: agenttypes.MessageDone{ParentToolUseID: "tool-1"},
+	}); !consumed {
+		t.Fatal("subagent done was not consumed")
+	}
+
+	aux, err := manager.GetExchangeAux(ctx, created.Key, 0)
+	if err != nil {
+		t.Fatalf("get child aux: %v", err)
+	}
+	found := false
+	for _, items := range aux {
+		for _, item := range items {
+			if item.Thought == "child thought" {
+				found = true
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("child thought aux = %#v", aux)
 	}
 }
 
@@ -798,6 +1001,78 @@ func TestClaudeSubagentRouterCreatesChildSessionAndRoutesChunks(t *testing.T) {
 	}
 }
 
+func TestClaudeSubagentRouterSeedsPromptAsUserExchange(t *testing.T) {
+	ctx := context.Background()
+	rootDir := t.TempDir()
+	root := rootfs.NewRootInfo("mindfs", "mindfs", rootDir)
+	manager := session.NewManager(root)
+	parent, err := manager.Create(ctx, session.CreateInput{Type: session.TypeChat, Agent: "claude", Name: "parent"})
+	if err != nil {
+		t.Fatalf("create parent: %v", err)
+	}
+
+	var created *session.Session
+	router := newClaudeSubagentRouter(subagentSessionInput{
+		RootID:  root.ID,
+		Parent:  parent,
+		Agent:   "claude",
+		Mode:    "default",
+		Effort:  "medium",
+		Manager: manager,
+		OnCreated: func(child *session.Session) {
+			created = child
+		},
+	})
+
+	parentTask := agenttypes.ToolCall{
+		CallID:  "tool-1",
+		Title:   "Review changes",
+		Status:  "running",
+		Kind:    agenttypes.ToolKindTask,
+		RawType: "tool_use",
+		Meta: map[string]any{
+			"prompt":      "Review the staged diff and report issues.",
+			"description": "Review changes",
+		},
+	}
+	if consumed := router.Handle(ctx, agenttypes.Event{Type: agenttypes.EventTypeToolCall, Data: parentTask}); consumed {
+		t.Fatal("parent task call should not be consumed")
+	}
+	if created != nil {
+		t.Fatal("parent task call should not create child")
+	}
+
+	if consumed := router.Handle(ctx, agenttypes.Event{
+		Type: agenttypes.EventTypeMessageChunk,
+		Data: agenttypes.MessageChunk{Content: "child response", ParentToolUseID: "tool-1"},
+	}); !consumed {
+		t.Fatal("subagent chunk was not consumed")
+	}
+	if created == nil {
+		t.Fatal("child session was not created")
+	}
+	if consumed := router.Handle(ctx, agenttypes.Event{
+		Type: agenttypes.EventTypeMessageDone,
+		Data: agenttypes.MessageDone{ParentToolUseID: "tool-1"},
+	}); !consumed {
+		t.Fatal("subagent done was not consumed")
+	}
+
+	loaded, err := manager.Get(ctx, created.Key, 0)
+	if err != nil {
+		t.Fatalf("get child: %v", err)
+	}
+	if len(loaded.Exchanges) != 2 {
+		t.Fatalf("child exchanges = %#v, want user + agent", loaded.Exchanges)
+	}
+	if loaded.Exchanges[0].Role != "user" || loaded.Exchanges[0].Content != "Review the staged diff and report issues." {
+		t.Fatalf("seeded user exchange = %#v", loaded.Exchanges[0])
+	}
+	if loaded.Exchanges[1].Role != "agent" || loaded.Exchanges[1].Content != "child response" {
+		t.Fatalf("agent exchange = %#v", loaded.Exchanges[1])
+	}
+}
+
 func TestClaudeSubagentRouterDoesNotCreateChildFromTaskIDOnly(t *testing.T) {
 	ctx := context.Background()
 	rootDir := t.TempDir()
@@ -858,6 +1133,42 @@ func TestClaudeSubagentRouterDoesNotCreateChildFromTaskIDOnly(t *testing.T) {
 	}
 	if createdCount != 1 {
 		t.Fatalf("createdCount after parent chunk = %d, want 1", createdCount)
+	}
+}
+
+func TestClaudeSubagentRouterIgnoresToolProgressUpdateWithoutChild(t *testing.T) {
+	ctx := context.Background()
+	rootDir := t.TempDir()
+	root := rootfs.NewRootInfo("mindfs", "mindfs", rootDir)
+	manager := session.NewManager(root)
+	parent, err := manager.Create(ctx, session.CreateInput{Type: session.TypeChat, Agent: "claude", Name: "parent"})
+	if err != nil {
+		t.Fatalf("create parent: %v", err)
+	}
+
+	var createdCount int
+	router := newClaudeSubagentRouter(subagentSessionInput{
+		RootID:  root.ID,
+		Parent:  parent,
+		Agent:   "claude",
+		Manager: manager,
+		OnCreated: func(*session.Session) {
+			createdCount++
+		},
+	})
+
+	heartbeat := agenttypes.ToolCall{
+		CallID: "call_00_AT1DtZL8sY6waNB01TLv1120-heartbeat-0",
+		Title:  "Bash",
+		Status: "running",
+		Kind:   agenttypes.ToolKindExecute,
+		Meta:   map[string]any{"parentToolUseId": "call_00_AT1DtZL8sY6waNB01TLv1120"},
+	}
+	if consumed := router.Handle(ctx, agenttypes.Event{Type: agenttypes.EventTypeToolUpdate, Data: heartbeat}); consumed {
+		t.Fatal("tool progress heartbeat should not be routed to a subagent")
+	}
+	if createdCount != 0 {
+		t.Fatalf("createdCount = %d, want 0", createdCount)
 	}
 }
 
@@ -928,6 +1239,257 @@ func TestClaudeSubagentRouterRoutesTaskNotificationSummaryAndKeepsParentUpdate(t
 	}
 }
 
+func testSubagentContextUpdate(parentToolUseID string, used, output int) agenttypes.Event {
+	cacheRead := 600
+	cacheWrite := 0
+	return agenttypes.Event{
+		Type: agenttypes.EventTypeContextUpdate,
+		Data: agenttypes.ContextUpdate{
+			ContextWindow: agenttypes.ContextWindow{TotalTokens: used},
+			TokenUsage: &agenttypes.TokenUsage{
+				InputTokens:      used,
+				OutputTokens:     output,
+				CacheReadTokens:  &cacheRead,
+				CacheWriteTokens: &cacheWrite,
+			},
+			ParentToolUseID: parentToolUseID,
+		},
+	}
+}
+
+func testParentTaskCall(callID, prompt string) agenttypes.ToolCall {
+	return agenttypes.ToolCall{
+		CallID:  callID,
+		Title:   "Do work",
+		Status:  "running",
+		Kind:    agenttypes.ToolKindTask,
+		RawType: "tool_use",
+		Meta:    map[string]any{"prompt": prompt},
+	}
+}
+
+func TestClaudeSubagentRouterBuffersContextUpdateUntilChildExists(t *testing.T) {
+	ctx := context.Background()
+	root := rootfs.NewRootInfo("mindfs", "mindfs", t.TempDir())
+	manager := session.NewManager(root)
+	parent, err := manager.Create(ctx, session.CreateInput{Type: session.TypeChat, Agent: "claude", Name: "parent"})
+	if err != nil {
+		t.Fatalf("create parent: %v", err)
+	}
+
+	var created *session.Session
+	var childEvents []agenttypes.Event
+	router := newClaudeSubagentRouter(subagentSessionInput{
+		RootID:  root.ID,
+		Parent:  parent,
+		Agent:   "claude",
+		Manager: manager,
+		OnCreated: func(child *session.Session) {
+			created = child
+		},
+		OnUpdate: func(sessionKey string, update agenttypes.Event) {
+			if created != nil && sessionKey == created.Key {
+				childEvents = append(childEvents, update)
+			}
+		},
+	})
+
+	if consumed := router.Handle(ctx, agenttypes.Event{Type: agenttypes.EventTypeToolCall, Data: testParentTaskCall("tool-1", "do it")}); consumed {
+		t.Fatal("parent task call should not be consumed")
+	}
+	if consumed := router.Handle(ctx, testSubagentContextUpdate("tool-1", 500, 40)); !consumed {
+		t.Fatal("context update should be consumed")
+	}
+	if created != nil {
+		t.Fatal("context update alone must not create a child")
+	}
+	if len(childEvents) != 0 {
+		t.Fatalf("child events before creation = %#v", childEvents)
+	}
+
+	if consumed := router.Handle(ctx, agenttypes.Event{
+		Type: agenttypes.EventTypeMessageChunk,
+		Data: agenttypes.MessageChunk{Content: "working", ParentToolUseID: "tool-1"},
+	}); !consumed {
+		t.Fatal("subagent chunk was not consumed")
+	}
+	if created == nil {
+		t.Fatal("child session was not created")
+	}
+	if len(childEvents) != 2 {
+		t.Fatalf("child events = %#v, want buffered context + chunk", childEvents)
+	}
+	if childEvents[0].Type != agenttypes.EventTypeContextUpdate || childEvents[1].Type != agenttypes.EventTypeMessageChunk {
+		t.Fatalf("child events = %#v", childEvents)
+	}
+}
+
+func TestClaudeSubagentRouterPersistsContextAndTokenUsage(t *testing.T) {
+	ctx := context.Background()
+	root := rootfs.NewRootInfo("mindfs", "mindfs", t.TempDir())
+	manager := session.NewManager(root)
+	parent, err := manager.Create(ctx, session.CreateInput{Type: session.TypeChat, Agent: "claude", Name: "parent"})
+	if err != nil {
+		t.Fatalf("create parent: %v", err)
+	}
+
+	var created *session.Session
+	var done *agenttypes.MessageDone
+	router := newClaudeSubagentRouter(subagentSessionInput{
+		RootID:  root.ID,
+		Parent:  parent,
+		Agent:   "claude",
+		Manager: manager,
+		OnCreated: func(child *session.Session) {
+			created = child
+		},
+		OnUpdate: func(sessionKey string, update agenttypes.Event) {
+			if update.Type != agenttypes.EventTypeMessageDone {
+				return
+			}
+			if data, ok := update.Data.(agenttypes.MessageDone); ok {
+				copy := data
+				done = &copy
+			}
+		},
+	})
+
+	if consumed := router.Handle(ctx, agenttypes.Event{Type: agenttypes.EventTypeToolCall, Data: testParentTaskCall("tool-1", "do it")}); consumed {
+		t.Fatal("parent task call should not be consumed")
+	}
+	if consumed := router.Handle(ctx, testSubagentContextUpdate("tool-1", 777, 33)); !consumed {
+		t.Fatal("context update should be consumed")
+	}
+	if consumed := router.Handle(ctx, agenttypes.Event{
+		Type: agenttypes.EventTypeMessageChunk,
+		Data: agenttypes.MessageChunk{Content: "working", ParentToolUseID: "tool-1"},
+	}); !consumed {
+		t.Fatal("subagent chunk was not consumed")
+	}
+
+	notification := agenttypes.ToolCall{
+		CallID:  "tool-1",
+		Title:   "done",
+		Status:  "complete",
+		Kind:    agenttypes.ToolKindTask,
+		RawType: "claude_task",
+		Meta: map[string]any{
+			"parentToolUseId": "tool-1",
+			"subtype":         "task_notification",
+			"summary":         "done",
+		},
+	}
+	if consumed := router.Handle(ctx, agenttypes.Event{Type: agenttypes.EventTypeToolUpdate, Data: notification}); consumed {
+		t.Fatal("terminal task update should still be visible on parent")
+	}
+
+	loaded, err := manager.Get(ctx, created.Key, 0)
+	if err != nil {
+		t.Fatalf("get child: %v", err)
+	}
+	if len(loaded.Exchanges) != 2 {
+		t.Fatalf("child exchanges = %#v, want user + agent", loaded.Exchanges)
+	}
+	if loaded.Exchanges[0].Role != "user" || loaded.Exchanges[0].Content != "do it" {
+		t.Fatalf("seeded user exchange = %#v", loaded.Exchanges[0])
+	}
+	agentExchange := loaded.Exchanges[1]
+	if agentExchange.Role != "agent" || agentExchange.Content != "workingdone" {
+		t.Fatalf("agent exchange = %#v", agentExchange)
+	}
+	if agentExchange.TokenUsage == nil || agentExchange.TokenUsage.InputTokens != 777 || agentExchange.TokenUsage.OutputTokens != 33 {
+		t.Fatalf("agent token usage = %#v", agentExchange.TokenUsage)
+	}
+	if agentExchange.TokenUsage.CacheReadTokens == nil || *agentExchange.TokenUsage.CacheReadTokens != 600 {
+		t.Fatalf("agent cache read = %#v", agentExchange.TokenUsage.CacheReadTokens)
+	}
+	wantContext := agenttypes.ContextWindow{TotalTokens: 777}
+	if loaded.LastContextWindow != wantContext {
+		t.Fatalf("LastContextWindow = %#v, want %#v", loaded.LastContextWindow, wantContext)
+	}
+	if done == nil || done.TokenUsage == nil || done.TokenUsage.OutputTokens != 33 || done.ContextWindow.TotalTokens != 777 {
+		t.Fatalf("done event = %#v", done)
+	}
+}
+
+func TestClaudeSubagentRouterFinishAllPersistsUsage(t *testing.T) {
+	ctx := context.Background()
+	root := rootfs.NewRootInfo("mindfs", "mindfs", t.TempDir())
+	manager := session.NewManager(root)
+	parent, err := manager.Create(ctx, session.CreateInput{Type: session.TypeChat, Agent: "claude", Name: "parent"})
+	if err != nil {
+		t.Fatalf("create parent: %v", err)
+	}
+
+	var created *session.Session
+	var done *agenttypes.MessageDone
+	router := newClaudeSubagentRouter(subagentSessionInput{
+		RootID:  root.ID,
+		Parent:  parent,
+		Agent:   "claude",
+		Manager: manager,
+		OnCreated: func(child *session.Session) {
+			created = child
+		},
+		OnUpdate: func(sessionKey string, update agenttypes.Event) {
+			if update.Type != agenttypes.EventTypeMessageDone {
+				return
+			}
+			if data, ok := update.Data.(agenttypes.MessageDone); ok {
+				copy := data
+				done = &copy
+			}
+		},
+	})
+
+	if consumed := router.Handle(ctx, agenttypes.Event{Type: agenttypes.EventTypeToolCall, Data: testParentTaskCall("tool-1", "do it")}); consumed {
+		t.Fatal("parent task call should not be consumed")
+	}
+	if consumed := router.Handle(ctx, testSubagentContextUpdate("tool-1", 900, 12)); !consumed {
+		t.Fatal("context update should be consumed")
+	}
+	if consumed := router.Handle(ctx, agenttypes.Event{
+		Type: agenttypes.EventTypeMessageChunk,
+		Data: agenttypes.MessageChunk{Content: "working", ParentToolUseID: "tool-1"},
+	}); !consumed {
+		t.Fatal("subagent chunk was not consumed")
+	}
+	router.FinishAll()
+
+	loaded, err := manager.Get(ctx, created.Key, 0)
+	if err != nil {
+		t.Fatalf("get child: %v", err)
+	}
+	if len(loaded.Exchanges) != 2 {
+		t.Fatalf("child exchanges = %#v, want user + agent", loaded.Exchanges)
+	}
+	if loaded.Exchanges[1].TokenUsage == nil || loaded.Exchanges[1].TokenUsage.OutputTokens != 12 {
+		t.Fatalf("agent token usage = %#v", loaded.Exchanges[1].TokenUsage)
+	}
+	if loaded.LastContextWindow.TotalTokens != 900 {
+		t.Fatalf("LastContextWindow = %#v", loaded.LastContextWindow)
+	}
+	if done == nil || done.ContextWindow.TotalTokens != 900 || done.TokenUsage == nil || done.TokenUsage.OutputTokens != 12 {
+		t.Fatalf("finish done event = %#v", done)
+	}
+
+	// A late child update is consumed, not leaked to the parent, and does not
+	// persist a second exchange.
+	if consumed := router.Handle(ctx, agenttypes.Event{
+		Type: agenttypes.EventTypeMessageDone,
+		Data: agenttypes.MessageDone{ParentToolUseID: "tool-1"},
+	}); !consumed {
+		t.Fatal("late child done should be consumed")
+	}
+	loaded, err = manager.Get(ctx, created.Key, 0)
+	if err != nil {
+		t.Fatalf("get child: %v", err)
+	}
+	if len(loaded.Exchanges) != 2 {
+		t.Fatalf("late done added an exchange: %#v", loaded.Exchanges)
+	}
+}
+
 func TestDedupeExchangeAuxBufferMergesDuplicateToolCalls(t *testing.T) {
 	items := []session.ExchangeAux{
 		{
@@ -969,6 +1531,44 @@ func TestDedupeExchangeAuxBufferMergesDuplicateToolCalls(t *testing.T) {
 	}
 	if toolCall.Meta["prompt"] != "prompt body" || toolCall.Meta["lastToolName"] != "Bash" {
 		t.Fatalf("toolCall meta = %#v", toolCall.Meta)
+	}
+}
+
+func TestDedupeExchangeAuxBufferKeepsToolCallsAtInvocationPosition(t *testing.T) {
+	items := []session.ExchangeAux{
+		{Seq: 1, ToolCall: &agenttypes.ToolCall{CallID: "call-a", Title: "Pull log A", Status: "running", Kind: agenttypes.ToolKindExecute}},
+		{Seq: 1, ToolCall: &agenttypes.ToolCall{CallID: "call-b", Title: "Pull log B", Status: "running", Kind: agenttypes.ToolKindExecute}},
+		{Seq: 1, Thought: "All failed with exit code1"},
+		{Seq: 1, ToolCall: &agenttypes.ToolCall{
+			CallID:  "call-b",
+			Status:  "complete",
+			Kind:    agenttypes.ToolKindExecute,
+			Content: []agenttypes.ToolCallContentItem{{Type: "text", Text: "B output"}},
+		}},
+		{Seq: 1, ToolCall: &agenttypes.ToolCall{
+			CallID:  "call-a",
+			Status:  "complete",
+			Kind:    agenttypes.ToolKindExecute,
+			Content: []agenttypes.ToolCallContentItem{{Type: "text", Text: "A output"}},
+		}},
+	}
+
+	got := dedupeExchangeAuxBuffer(items)
+	if len(got) != 3 {
+		t.Fatalf("deduped items = %#v, want two tool calls followed by the thought", got)
+	}
+	if got[0].ToolCall == nil || got[0].ToolCall.CallID != "call-a" ||
+		got[0].ToolCall.Status != "complete" || len(got[0].ToolCall.Content) != 1 ||
+		got[0].ToolCall.Content[0].Text != "A output" {
+		t.Fatalf("first item = %#v, want completed call-a at its invocation slot", got[0].ToolCall)
+	}
+	if got[1].ToolCall == nil || got[1].ToolCall.CallID != "call-b" ||
+		got[1].ToolCall.Status != "complete" || len(got[1].ToolCall.Content) != 1 ||
+		got[1].ToolCall.Content[0].Text != "B output" {
+		t.Fatalf("second item = %#v, want completed call-b at its invocation slot", got[1].ToolCall)
+	}
+	if got[2].Thought != "All failed with exit code1" {
+		t.Fatalf("third item = %#v, want the thought that followed the calls", got[2])
 	}
 }
 
@@ -2186,6 +2786,27 @@ func runUsecaseGit(t *testing.T, root string, args ...string) string {
 	return string(out)
 }
 
+func runUsecaseSVNCommand(t *testing.T, dir, name string, args ...string) string {
+	t.Helper()
+	cmd := exec.Command(name, args...)
+	if dir != "" {
+		cmd.Dir = dir
+	}
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("%s %s returned error: %v\n%s", name, strings.Join(args, " "), err, strings.TrimSpace(string(out)))
+	}
+	return string(out)
+}
+
+func usecaseFileURL(path string) string {
+	slashed := filepath.ToSlash(path)
+	if !strings.HasPrefix(slashed, "/") {
+		slashed = "/" + slashed
+	}
+	return "file://" + slashed
+}
+
 func sameUsecaseTestPath(left, right string) bool {
 	left = filepath.Clean(left)
 	right = filepath.Clean(right)
@@ -2610,7 +3231,7 @@ func TestDeleteSessionCleansTaskGroupsBeforeDeletingSessions(t *testing.T) {
 				return []string{execution.Key}, nil
 			}
 			svc := Service{Registry: registry}
-			err = svc.DeleteSession(ctx, DeleteSessionInput{RootID: root.ID, Key: parent.Key})
+			_, err = svc.DeleteSession(ctx, DeleteSessionInput{RootID: root.ID, Key: parent.Key})
 			if !called || (err != nil) != fails {
 				t.Fatalf("called=%v err=%v", called, err)
 			}
@@ -2644,5 +3265,27 @@ func TestBuildPromptAddsMindFSContextOnlyToInitialMessage(t *testing.T) {
 				t.Fatalf("missing task identity: %s", prompt)
 			}
 		}
+	}
+}
+
+func TestSvnRelatedFileDiffRejectsRepoPathOutsideRoot(t *testing.T) {
+	base := t.TempDir()
+	rootDir := filepath.Join(base, "root")
+	outsideDir := filepath.Join(base, "outside")
+	if err := os.MkdirAll(rootDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(outsideDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	root := rootfs.NewRootInfo("root", "svn-root", rootDir)
+	service := Service{Registry: uploadTestRegistry{root: root}}
+	_, err := service.GetSvnRelatedFileDiff(context.Background(), SvnRelatedFileDiffInput{
+		RootID:   root.ID,
+		RepoPath: outsideDir,
+		Path:     "file.txt",
+	})
+	if err == nil || !strings.Contains(err.Error(), "inside the managed root") {
+		t.Fatalf("GetSvnRelatedFileDiff error = %v, want outside-root rejection", err)
 	}
 }

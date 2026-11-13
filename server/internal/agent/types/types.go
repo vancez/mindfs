@@ -126,6 +126,9 @@ type OpenSessionInput struct {
 	AgentSessionID        string
 	AgentCtxSeq           int
 	ForkPoint             ResolveForkPointOutput
+	// InitialTaskList seeds session task-list state after a resume so snapshot
+	// events do not lose tasks created before the agent process restarted.
+	InitialTaskList *TaskListUpdate
 }
 
 type RuntimeDefaults struct {
@@ -275,16 +278,18 @@ type CommandList struct {
 type EventType string
 
 const (
-	EventTypeMessageChunk EventType = "message_chunk"
-	EventTypeThoughtChunk EventType = "thought_chunk"
-	EventTypeToolCall     EventType = "tool_call"
-	EventTypeToolUpdate   EventType = "tool_update"
-	EventTypeTodoUpdate   EventType = "todo_update"
-	EventTypePlanUpdate   EventType = "plan_update"
-	EventTypeCompact      EventType = "compact_notice"
-	EventTypeLogin        EventType = "login_notice"
-	EventTypeMessageDone  EventType = "message_done"
-	EventTypeRecovery     EventType = "recovery"
+	EventTypeMessageChunk  EventType = "message_chunk"
+	EventTypeThoughtChunk  EventType = "thought_chunk"
+	EventTypeToolCall      EventType = "tool_call"
+	EventTypeToolUpdate    EventType = "tool_update"
+	EventTypeTodoUpdate    EventType = "todo_update"
+	EventTypeTaskUpdate    EventType = "task_update"
+	EventTypePlanUpdate    EventType = "plan_update"
+	EventTypeCompact       EventType = "compact_notice"
+	EventTypeLogin         EventType = "login_notice"
+	EventTypeMessageDone   EventType = "message_done"
+	EventTypeContextUpdate EventType = "context_update"
+	EventTypeRecovery      EventType = "recovery"
 )
 
 // Event is a normalized session update emitted by any agent backend.
@@ -320,6 +325,18 @@ type MessageDone struct {
 	TaskDescription string        `json:"taskDescription,omitempty"`
 }
 
+// ContextUpdate carries live context-window usage between turn boundaries.
+// Subagent updates reuse the same event with the child's ref fields so the
+// router can attribute them to a synthetic child session.
+type ContextUpdate struct {
+	ContextWindow   ContextWindow `json:"contextWindow"`
+	TokenUsage      *TokenUsage   `json:"tokenUsage,omitempty"`
+	ParentToolUseID string        `json:"parentToolUseId,omitempty"`
+	TaskID          string        `json:"taskId,omitempty"`
+	SubagentType    string        `json:"subagentType,omitempty"`
+	TaskDescription string        `json:"taskDescription,omitempty"`
+}
+
 type RecoveryStatus struct {
 	Message string `json:"message"`
 }
@@ -332,6 +349,23 @@ type TodoItem struct {
 
 type TodoUpdate struct {
 	Items []TodoItem `json:"items"`
+}
+
+// TaskItem is one entry of the agent's session task list (Claude TaskCreate /
+// TaskUpdate / TaskList / TaskGet). Status is normalized to MindFS task-tool
+// statuses: pending, running, complete, failed, cancelled.
+type TaskItem struct {
+	ID          string `json:"id"`
+	Subject     string `json:"subject"`
+	Description string `json:"description,omitempty"`
+	ActiveForm  string `json:"activeForm,omitempty"`
+	Status      string `json:"status"`
+}
+
+// TaskListUpdate is a full snapshot of the session task list. Each event
+// replaces the previous snapshot.
+type TaskListUpdate struct {
+	Items []TaskItem `json:"items"`
 }
 
 type PlanUpdate struct {

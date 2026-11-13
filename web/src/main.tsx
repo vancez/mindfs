@@ -8,6 +8,7 @@ import { isHarmonyRuntime, isNativeShellRuntime } from "./services/runtime";
 import { Login } from "./components/Login";
 import { NodesPage } from "./components/NodesPage";
 import { isNodePage, rememberNodePage, returnNodePageURL } from "./services/nodePage";
+import { computeViewportOffsetTop, MOBILE_LAYOUT_QUERY } from "./services/viewport";
 import { I18nProvider, translateNow } from "./i18n";
 
 applyAppearanceMode();
@@ -281,6 +282,8 @@ function isIOSWebKit(): boolean {
 }
 
 let largestNativeViewportHeight = 0;
+let rotationSettleTimers: number[] = [];
+let rotationSettleFrame: number | null = null;
 
 function readRootPixelVar(name: string): number {
   if (typeof document === "undefined") {
@@ -289,6 +292,12 @@ function readRootPixelVar(name: string): number {
   const value = getComputedStyle(document.documentElement).getPropertyValue(name).trim();
   const parsed = Number.parseFloat(value);
   return Number.isFinite(parsed) ? Math.max(0, parsed) : 0;
+}
+
+function isMobileFixedLayout(): boolean {
+  return typeof window !== "undefined" &&
+    typeof window.matchMedia === "function" &&
+    window.matchMedia(MOBILE_LAYOUT_QUERY).matches;
 }
 
 function syncViewportHeight(): void {
@@ -313,9 +322,9 @@ function syncViewportHeight(): void {
     const remainingImeOverlay = Math.max(0, imeBottom - resizedBy);
     viewportHeight = Math.max(320, rawViewportHeight - remainingImeOverlay);
   }
-  const viewportOffsetTop = isNativeShell || !visualViewport
-    ? 0
-    : Math.max(0, visualViewport.offsetTop || 0);
+  const viewportOffsetTop = visualViewport
+    ? computeViewportOffsetTop(isNativeShell, isMobileFixedLayout(), visualViewport.offsetTop)
+    : 0;
   document.documentElement.style.setProperty("--mindfs-viewport-height", `${viewportHeight}px`);
   document.documentElement.style.setProperty("--mindfs-viewport-offset-top", `${viewportOffsetTop}px`);
 }
@@ -329,6 +338,48 @@ function syncViewportHeightAfterKeyboardChange(): void {
   window.setTimeout(() => window.scrollTo(0, 0), 120);
   window.setTimeout(syncViewportHeight, 320);
   window.setTimeout(() => window.scrollTo(0, 0), 320);
+}
+
+function clearRotationSettle(): void {
+  if (typeof window === "undefined") {
+    return;
+  }
+  for (const timer of rotationSettleTimers) {
+    window.clearTimeout(timer);
+  }
+  rotationSettleTimers = [];
+  if (rotationSettleFrame !== null) {
+    window.cancelAnimationFrame(rotationSettleFrame);
+    rotationSettleFrame = null;
+  }
+}
+
+function syncViewportHeightAfterRotation(): void {
+  if (typeof window === "undefined" || typeof document === "undefined") {
+    return;
+  }
+
+  clearRotationSettle();
+  // The offset still in the variable was measured against the landscape or
+  // desktop layout. Drop it before the portrait fixed layout consumes it, then
+  // re-measure once iOS has settled the new viewport.
+  document.documentElement.style.setProperty("--mindfs-viewport-offset-top", "0px");
+  window.scrollTo(0, 0);
+
+  const settle = () => {
+    window.scrollTo(0, 0);
+    syncViewportHeight();
+  };
+  rotationSettleFrame = window.requestAnimationFrame(() => {
+    rotationSettleFrame = null;
+    settle();
+  });
+  rotationSettleTimers = [
+    window.setTimeout(settle, 120),
+    window.setTimeout(settle, 320),
+    // Final measurement only: do not fight a user who started scrolling.
+    window.setTimeout(syncViewportHeight, 640),
+  ];
 }
 
 function canScrollTouchTarget(target: EventTarget | null, deltaY: number): boolean {
@@ -407,7 +458,7 @@ function AppRoot() {
 
     syncViewportHeight();
     window.addEventListener("resize", syncViewportHeight);
-    window.addEventListener("orientationchange", syncViewportHeight);
+    window.addEventListener("orientationchange", syncViewportHeightAfterRotation);
     window.addEventListener("focusin", syncViewportHeightAfterKeyboardChange);
     window.addEventListener("focusout", syncViewportHeightAfterKeyboardChange);
     window.addEventListener("mindfs:safe-area-updated", syncViewportHeight as EventListener);
@@ -418,12 +469,13 @@ function AppRoot() {
     if (!isNativeShellRuntime()) {
       return () => {
         window.removeEventListener("resize", syncViewportHeight);
-        window.removeEventListener("orientationchange", syncViewportHeight);
+        window.removeEventListener("orientationchange", syncViewportHeightAfterRotation);
         window.removeEventListener("focusin", syncViewportHeightAfterKeyboardChange);
         window.removeEventListener("focusout", syncViewportHeightAfterKeyboardChange);
         window.removeEventListener("mindfs:safe-area-updated", syncViewportHeight as EventListener);
         window.visualViewport?.removeEventListener("resize", syncViewportHeight);
         window.visualViewport?.removeEventListener("scroll", syncViewportHeight);
+        clearRotationSettle();
         uninstallIOSKeyboardPanLock();
       };
     }
@@ -592,12 +644,13 @@ function AppRoot() {
 
     return () => {
       window.removeEventListener("resize", syncViewportHeight);
-      window.removeEventListener("orientationchange", syncViewportHeight);
+      window.removeEventListener("orientationchange", syncViewportHeightAfterRotation);
       window.removeEventListener("focusin", syncViewportHeightAfterKeyboardChange);
       window.removeEventListener("focusout", syncViewportHeightAfterKeyboardChange);
       window.removeEventListener("mindfs:safe-area-updated", syncViewportHeight as EventListener);
       window.visualViewport?.removeEventListener("resize", syncViewportHeight);
       window.visualViewport?.removeEventListener("scroll", syncViewportHeight);
+      clearRotationSettle();
       cleanupThemeSync?.();
       document.removeEventListener("focusin", onFocusIn);
       window.visualViewport?.removeEventListener("resize", onViewportResize);

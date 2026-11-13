@@ -95,6 +95,86 @@ func TestResolveRelatedWorktreePrefersNestedTaskWorktree(t *testing.T) {
 	}
 }
 
+func TestResolveRelatedWorktreeDetectsSvnWorkingCopy(t *testing.T) {
+	if _, err := exec.LookPath("svn"); err != nil {
+		t.Skip("svn not found")
+	}
+	if _, err := exec.LookPath("svnadmin"); err != nil {
+		t.Skip("svnadmin not found")
+	}
+	base := t.TempDir()
+	repo := filepath.Join(base, "repo")
+	wc := filepath.Join(base, "wc")
+	runAPITestCommand(t, "", "svnadmin", "create", repo)
+	runAPITestCommand(t, "", "svn", "--non-interactive", "checkout", "-q", apiFileURL(repo), wc)
+	if err := os.WriteFile(filepath.Join(wc, "tracked.txt"), []byte("one\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile tracked.txt: %v", err)
+	}
+	runAPITestCommand(t, wc, "svn", "--non-interactive", "add", "tracked.txt")
+	runAPITestCommand(t, wc, "svn", "--non-interactive", "commit", "-q", "-m", "r1")
+
+	match, ok := resolveRelatedWorktree(
+		context.Background(),
+		rootfs.NewRootInfo("root", "svn-root", wc),
+		filepath.Join(wc, "tracked.txt"),
+	)
+	if !ok {
+		t.Fatal("resolveRelatedWorktree returned false for an SVN working copy")
+	}
+	if match.RepoKind != "svn" {
+		t.Fatalf("RepoKind = %q, want svn", match.RepoKind)
+	}
+	if !sameAPITestPath(match.Path, wc) {
+		t.Fatalf("match.Path = %q, want %q", match.Path, wc)
+	}
+	if match.Head != "1" {
+		t.Fatalf("Head = %q, want 1", match.Head)
+	}
+
+	if err := os.WriteFile(filepath.Join(wc, "untracked.txt"), []byte("new\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile untracked.txt: %v", err)
+	}
+	untracked, ok := resolveRelatedWorktree(
+		context.Background(),
+		rootfs.NewRootInfo("root", "svn-root", wc),
+		filepath.Join(wc, "untracked.txt"),
+	)
+	if !ok {
+		t.Fatal("resolveRelatedWorktree returned false for an unversioned SVN file")
+	}
+	if untracked.RepoKind != "svn" || untracked.Head == "" {
+		t.Fatalf("unexpected unversioned match: %+v", untracked)
+	}
+}
+
+func TestManagedDirResponseIncludesSvnFlag(t *testing.T) {
+	if _, err := exec.LookPath("svn"); err != nil {
+		t.Skip("svn not found")
+	}
+	if _, err := exec.LookPath("svnadmin"); err != nil {
+		t.Skip("svnadmin not found")
+	}
+	base := t.TempDir()
+	repo := filepath.Join(base, "repo")
+	wc := filepath.Join(base, "wc")
+	runAPITestCommand(t, "", "svnadmin", "create", repo)
+	runAPITestCommand(t, "", "svn", "--non-interactive", "checkout", "-q", apiFileURL(repo), wc)
+
+	resp := managedDirResponse(rootfs.NewRootInfo("root", "svn-root", wc))
+	if resp["is_svn_repo"] != true {
+		t.Fatalf("is_svn_repo = %v, want true", resp["is_svn_repo"])
+	}
+	if resp["is_git_repo"] == true {
+		t.Fatalf("is_git_repo = true, want false")
+	}
+
+	plain := t.TempDir()
+	plainResp := managedDirResponse(rootfs.NewRootInfo("plain", "plain", plain))
+	if plainResp["is_svn_repo"] != false {
+		t.Fatalf("plain is_svn_repo = %v, want false", plainResp["is_svn_repo"])
+	}
+}
+
 func runAPITestGit(t *testing.T, root string, args ...string) string {
 	t.Helper()
 	cmd := exec.Command("git", args...)
@@ -104,6 +184,27 @@ func runAPITestGit(t *testing.T, root string, args ...string) string {
 		t.Fatalf("git %s returned error: %v\n%s", strings.Join(args, " "), err, strings.TrimSpace(string(out)))
 	}
 	return string(out)
+}
+
+func runAPITestCommand(t *testing.T, dir, name string, args ...string) string {
+	t.Helper()
+	cmd := exec.Command(name, args...)
+	if dir != "" {
+		cmd.Dir = dir
+	}
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("%s %s returned error: %v\n%s", name, strings.Join(args, " "), err, strings.TrimSpace(string(out)))
+	}
+	return string(out)
+}
+
+func apiFileURL(path string) string {
+	slashed := filepath.ToSlash(path)
+	if !strings.HasPrefix(slashed, "/") {
+		slashed = "/" + slashed
+	}
+	return "file://" + slashed
 }
 
 func sameAPITestPath(left, right string) bool {

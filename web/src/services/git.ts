@@ -34,6 +34,12 @@ export type GitDiffPayload = CachedGitDiffPayload & {
   base_head?: string;
   target_head?: string;
   source?: "worktree" | "commit" | "commit_range";
+  svn_status?: string;
+  binary?: boolean;
+  property_changes?: boolean;
+  property_only?: boolean;
+  base_revision?: string;
+  target_revision?: string;
 };
 
 export type GitHistoryItem = {

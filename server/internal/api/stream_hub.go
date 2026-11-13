@@ -19,11 +19,19 @@ import (
 	"github.com/gorilla/websocket"
 )
 
+type wsFrameState struct {
+	mu       sync.Mutex
+	inbound  uint64
+	outbound uint64
+}
+
 type StreamHub struct {
 	mu              sync.RWMutex
 	e2eeManager     *e2ee.Manager
 	clients         map[string]*websocket.Conn
 	connLocks       map[*websocket.Conn]*sync.Mutex
+	frameStates     map[*websocket.Conn]*wsFrameState
+	focusedClients  map[string]bool
 	sessionClients  map[string]map[string]struct{}
 	pendingSessions map[string]*SessionPendingState
 	replayStates    map[string]*ClientReplayState
@@ -110,6 +118,8 @@ func NewStreamHub(e2eeManager *e2ee.Manager) *StreamHub {
 		e2eeManager:     e2eeManager,
 		clients:         make(map[string]*websocket.Conn),
 		connLocks:       make(map[*websocket.Conn]*sync.Mutex),
+		frameStates:     make(map[*websocket.Conn]*wsFrameState),
+		focusedClients:  make(map[string]bool),
 		sessionClients:  make(map[string]map[string]struct{}),
 		pendingSessions: make(map[string]*SessionPendingState),
 		replayStates:    make(map[string]*ClientReplayState),
@@ -273,6 +283,12 @@ func (h *StreamHub) RegisterClient(clientID string, conn *websocket.Conn) *webso
 	if _, ok := h.connLocks[conn]; !ok {
 		h.connLocks[conn] = &sync.Mutex{}
 	}
+	if _, ok := h.frameStates[conn]; !ok {
+		h.frameStates[conn] = &wsFrameState{}
+	}
+	if previous != nil && previous != conn {
+		delete(h.frameStates, previous)
+	}
 	h.mu.Unlock()
 	if previous == conn {
 		return nil
@@ -288,10 +304,12 @@ func (h *StreamHub) UnregisterClient(clientID string, conn *websocket.Conn) {
 	defer h.mu.Unlock()
 	existing := h.clients[clientID]
 	delete(h.connLocks, conn)
+	delete(h.frameStates, conn)
 	if existing != conn {
 		return
 	}
 	delete(h.clients, clientID)
+	delete(h.focusedClients, clientID)
 	for sessionKey, clientSet := range h.sessionClients {
 		delete(clientSet, clientID)
 		if len(clientSet) == 0 {
@@ -356,6 +374,39 @@ func (h *StreamHub) getAllClientIDs() []string {
 		}
 	}
 	return clientIDs
+}
+
+// SetClientFocused records whether a connected client currently has the app in
+// the foreground. Web push is suppressed while any client is focused because
+// the same update is already delivered over the websocket.
+func (h *StreamHub) SetClientFocused(clientID string, focused bool) {
+	if h == nil || blank(clientID) {
+		return
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if focused {
+		if h.focusedClients == nil {
+			h.focusedClients = make(map[string]bool)
+		}
+		h.focusedClients[clientID] = true
+		return
+	}
+	delete(h.focusedClients, clientID)
+}
+
+func (h *StreamHub) HasFocusedClient() bool {
+	if h == nil {
+		return false
+	}
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	for clientID := range h.focusedClients {
+		if h.clients[clientID] != nil {
+			return true
+		}
+	}
+	return false
 }
 
 func (h *StreamHub) SetPendingUser(rootID, sessionKey, sessionTitle, agent, model, mode, effort, fastService string, planMode bool, content string) *PendingUserMessage {
@@ -663,6 +714,18 @@ func (h *StreamHub) PendingSessionSnapshot(sessionKey string) PendingSessionSnap
 	}
 }
 
+// SessionPending reports whether the session currently has an in-flight reply.
+// Session lists use it as the source of truth for the reply indicator.
+func (h *StreamHub) SessionPending(sessionKey string) bool {
+	if h == nil || blank(sessionKey) {
+		return false
+	}
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	state := h.pendingSessions[sessionKey]
+	return state != nil && state.Active
+}
+
 func (h *StreamHub) AppendReplyEvent(sessionKey string, event StreamEvent) StreamEvent {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -711,6 +774,7 @@ func isAuxiliarySummaryBoundary(eventType string) bool {
 		agenttypes.EventTypeToolCall,
 		agenttypes.EventTypeToolUpdate,
 		agenttypes.EventTypeTodoUpdate,
+		agenttypes.EventTypeTaskUpdate,
 		agenttypes.EventTypePlanUpdate,
 		agenttypes.EventTypeCompact:
 		return true
@@ -931,6 +995,7 @@ func (h *StreamHub) BroadcastSessionUserMessageAt(
 	baseExchangeSeq ...int,
 ) {
 	pendingUser := h.SetPendingUserAt(rootID, sessionKey, sessionName, agentName, model, mode, effort, fastService, planMode, content, timestamp, baseExchangeSeq...)
+	h.BroadcastSessionPending(rootID, sessionKey, true)
 	resp := buildSessionUserMessageResponse(rootID, sessionKey, sessionType, sessionName, agentName, model, mode, effort, fastService, planMode, content, pendingUser.Timestamp, queued)
 	for _, clientID := range h.GetSessionClientIDs(sessionKey, false) {
 		if clientID == excludeClientID {
@@ -938,6 +1003,24 @@ func (h *StreamHub) BroadcastSessionUserMessageAt(
 		}
 		h.SendToClient(clientID, resp)
 	}
+}
+
+// BroadcastSessionPending notifies every connected client when a session
+// starts or stops replying. Stream and done events only reach clients bound to
+// the session, but session lists on other browsers still show the reply
+// indicator, so the pending flag has to travel globally.
+func (h *StreamHub) BroadcastSessionPending(rootID, sessionKey string, pending bool) {
+	if h == nil || blank(rootID) || blank(sessionKey) {
+		return
+	}
+	h.BroadcastAll(WSResponse{
+		Type: "session.pending.updated",
+		Payload: map[string]any{
+			"root_id":     rootID,
+			"session_key": sessionKey,
+			"pending":     pending,
+		},
+	})
 }
 
 func (h *StreamHub) BroadcastSessionQueueUpdated(rootID, sessionKey string, queue []QueuedUserMessage) {
@@ -978,13 +1061,65 @@ func (h *StreamHub) WriteJSON(clientID string, conn *websocket.Conn, value any) 
 		if err != nil {
 			return err
 		}
-		envelope, err := e2ee.EncryptBytes(sess.Key, payload)
+		state := h.frameState(conn)
+		state.mu.Lock()
+		sequence := state.outbound
+		state.mu.Unlock()
+		envelope, err := e2ee.EncryptBytesWithAAD(
+			sess.Key,
+			e2ee.WSAAD(e2ee.WSFrameServerToClient, sequence),
+			payload,
+		)
 		if err != nil {
 			return err
 		}
+		state.mu.Lock()
+		if state.outbound == sequence {
+			state.outbound++
+		}
+		state.mu.Unlock()
 		return conn.WriteJSON(envelope)
 	}
 	return conn.WriteJSON(value)
+}
+
+func (h *StreamHub) frameState(conn *websocket.Conn) *wsFrameState {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.frameStates == nil {
+		h.frameStates = make(map[*websocket.Conn]*wsFrameState)
+	}
+	state := h.frameStates[conn]
+	if state == nil {
+		state = &wsFrameState{}
+		h.frameStates[conn] = state
+	}
+	return state
+}
+
+// DecryptWSMessage enforces the per-connection, per-direction frame sequence.
+// A replayed or out-of-order frame fails authentication.
+func (h *StreamHub) DecryptWSMessage(conn *websocket.Conn, key []byte, envelope *e2ee.CipherEnvelope) ([]byte, error) {
+	state := h.frameState(conn)
+	state.mu.Lock()
+	sequence := state.inbound
+	state.mu.Unlock()
+	plaintext, err := e2ee.DecryptBytesWithAAD(
+		key,
+		e2ee.WSAAD(e2ee.WSFrameClientToServer, sequence),
+		envelope,
+	)
+	if err != nil {
+		return nil, err
+	}
+	state.mu.Lock()
+	if state.inbound != sequence {
+		state.mu.Unlock()
+		return nil, e2ee.ErrStreamInvalid
+	}
+	state.inbound++
+	state.mu.Unlock()
+	return plaintext, nil
 }
 
 func (h *StreamHub) getConnLock(conn *websocket.Conn) *sync.Mutex {

@@ -135,6 +135,23 @@ func TestReadRelatedFileDiffRejectsHeadOutsideCurrentHistory(t *testing.T) {
 	}
 }
 
+func TestCommitAllowsMultilineMessage(t *testing.T) {
+	root := initTestRepo(t)
+	writeTestFile(t, root, "note.txt", "base\n")
+	runTestGit(t, root, "add", "note.txt")
+	result, err := Commit(context.Background(), root, "subject line\n\nbody line")
+	if err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+	if len(result.Status.Items) != 0 {
+		t.Fatalf("status after commit is not clean: %+v", result.Status.Items)
+	}
+	message := runTestGit(t, root, "log", "-1", "--pretty=%B")
+	if !strings.Contains(message, "subject line") || !strings.Contains(message, "body line") {
+		t.Fatalf("multiline commit message was not preserved:\n%s", message)
+	}
+}
+
 func initTestRepo(t *testing.T) string {
 	t.Helper()
 	if _, err := exec.LookPath("git"); err != nil {

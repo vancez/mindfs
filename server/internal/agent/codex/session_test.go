@@ -368,3 +368,28 @@ func TestHandleUnknownPlanAndContextCompactionItems(t *testing.T) {
 		t.Fatalf("compact notice = %#v", updates[1].Data)
 	}
 }
+
+func TestCodexAskUserAnswerValuesSplitsSelectionsAndCustomText(t *testing.T) {
+	question := codexsdk.AskUserQuestion{
+		Options: []codexsdk.AskUserQuestionOption{
+			{Label: "Option A"},
+			{Label: "Option B"},
+		},
+	}
+	cases := []struct {
+		value string
+		want  string
+	}{
+		{"Option A", "Option A"},
+		{"Option A, custom text", "Option A|custom text"},
+		{"Option A, Option B", "Option A|Option B"},
+		{"Option A, custom, with comma", "Option A|custom, with comma"},
+		{"just freeform", "just freeform"},
+	}
+	for _, tc := range cases {
+		got := strings.Join(codexAskUserAnswerValues(question, tc.value), "|")
+		if got != tc.want {
+			t.Fatalf("codexAskUserAnswerValues(%q) = %q, want %q", tc.value, got, tc.want)
+		}
+	}
+}

@@ -4,6 +4,7 @@ import {
   type CompactNotice,
   type ExchangeAux,
   type PlanUpdate,
+  type TaskListUpdate,
   type TodoUpdate,
   type ToolCall,
   type TokenUsage,
@@ -28,9 +29,11 @@ type ExchangeLike = {
   timestamp?: string;
   toolCall?: ToolCall;
   todoUpdate?: TodoUpdate;
+  tasksUpdate?: TaskListUpdate;
   planUpdate?: PlanUpdate;
   compactNotice?: CompactNotice;
   pending_ack?: boolean;
+  persisted?: boolean;
 };
 
 type ExchangeAuxMapLike = Record<string, ExchangeAux[]>;
@@ -48,15 +51,17 @@ export type TimelineItem =
       fastService?: string;
       pendingAck?: boolean;
       seq?: number;
+      persisted?: boolean;
       contextWindow?: {
         totalTokens: number;
         modelContextWindow: number;
       };
       tokenUsage?: TokenUsage;
     }
-  | { id: string; type: "thought"; content: string }
+  | { id: string; type: "thought"; content: string; thoughtId?: string }
   | { id: string; type: "tool"; toolCall: ToolCall }
   | { id: string; type: "todo"; todoUpdate: TodoUpdate; timestamp?: string }
+  | { id: string; type: "tasks"; tasksUpdate: TaskListUpdate; timestamp?: string }
   | { id: string; type: "plan"; planUpdate: PlanUpdate; timestamp?: string }
   | { id: string; type: "compact"; compactNotice: CompactNotice; timestamp?: string };
 
@@ -65,6 +70,9 @@ type UseSessionStreamResult = {
   isStreaming: boolean;
   streamVersion: number;
   streamStatusText: string;
+  // Latest task-list snapshot, including empty snapshots that are skipped in
+  // the inline timeline so a persistent task panel can hide itself.
+  latestTaskList: TaskListUpdate | null;
 };
 
 type ContextWindowLike = {
@@ -91,6 +99,16 @@ function stableTimelineID(
   return `${prefix}:${index}:${timestamp || ""}:${agent || ""}:${hashText(content)}`;
 }
 
+// Server-side ids are not unique across exchanges: when a turn is interrupted
+// while a tool call is still running, its completion is persisted into the next
+// turn, so the same callId shows up twice. Timeline identity has to include the
+// exchange that recorded the item; duplicate keys made React reuse the wrong
+// card state (expanding B showed A's details) and collided in the virtualizer's
+// size cache, which stacked rows on top of each other.
+function exchangeScopedID(prefix: string, index: number, id: string): string {
+  return `${prefix}:${index}:${id}`;
+}
+
 function normalizeRole(role?: string): string {
   return (role || "").toLowerCase();
 }
@@ -100,6 +118,18 @@ function normalizeToolCallStatus(status?: string): string {
   if (value === "completed") return "complete";
   if (value === "pending") return "running";
   return value || "running";
+}
+
+// TaskCreate/TaskUpdate/TaskList/TaskGet are internal task-list plumbing. The
+// task list card owns their presentation, so their tool cards are omitted from
+// the transcript (an update after a turn boundary has no title and would
+// otherwise render as "tool" with the raw taskId/status input).
+function isTaskListToolCall(toolCall: ToolCall): boolean {
+  if ((toolCall.kind || "").toLowerCase() !== "task") {
+    return false;
+  }
+  const taskTool = toolCall.meta?.taskTool;
+  return typeof taskTool === "string" && taskTool.trim() !== "";
 }
 
 function normalizeToolCall(input: ToolCall): ToolCall {
@@ -161,6 +191,7 @@ function assistantSegmentItem(
     effort: ex.effort,
     fastService: ex.fast_service,
     seq: ex.seq,
+    persisted: ex.persisted,
     contextWindow: includeContextWindow ? ex.context_window : undefined,
     tokenUsage: includeContextWindow ? ex.token_usage : undefined,
   };
@@ -211,30 +242,31 @@ function buildAssistantTimeline(
     }
     if (aux.thought) {
       out.push({
-        id:
-          aux.thought_id ||
-          stableTimelineID(
-            "thought",
-            index * 1000 + segmentIndex,
-            aux.thought,
-            ex.timestamp,
-            ex.agent,
-          ),
+        id: aux.thought_id
+          ? exchangeScopedID("thought", index, aux.thought_id)
+          : stableTimelineID(
+              "thought",
+              index * 1000 + segmentIndex,
+              aux.thought,
+              ex.timestamp,
+              ex.agent,
+            ),
         type: "thought",
         content: aux.thought,
+        thoughtId: aux.thought_id || undefined,
       });
       segmentIndex += 1;
     } else if (aux.plan) {
       out.push({
-        id:
-          aux.plan.id ||
-          stableTimelineID(
-            "plan",
-            index * 1000 + segmentIndex,
-            aux.plan.content || "",
-            ex.timestamp,
-            ex.agent,
-          ),
+        id: aux.plan.id
+          ? exchangeScopedID("plan", index, aux.plan.id)
+          : stableTimelineID(
+              "plan",
+              index * 1000 + segmentIndex,
+              aux.plan.content || "",
+              ex.timestamp,
+              ex.agent,
+            ),
         type: "plan",
         planUpdate: aux.plan,
         timestamp: ex.timestamp,
@@ -254,17 +286,33 @@ function buildAssistantTimeline(
         timestamp: ex.timestamp,
       });
       segmentIndex += 1;
-    } else if (aux.compact) {
-      out.push({
-        id:
-          aux.compact.id ||
-          stableTimelineID(
-            "compact",
+    } else if (aux.tasks) {
+      if (aux.tasks.items?.length) {
+        out.push({
+          id: stableTimelineID(
+            "tasks",
             index * 1000 + segmentIndex,
-            JSON.stringify(aux.compact),
+            JSON.stringify(aux.tasks),
             ex.timestamp,
             ex.agent,
           ),
+          type: "tasks",
+          tasksUpdate: aux.tasks,
+          timestamp: ex.timestamp,
+        });
+        segmentIndex += 1;
+      }
+    } else if (aux.compact) {
+      out.push({
+        id: aux.compact.id
+          ? exchangeScopedID("compact", index, aux.compact.id)
+          : stableTimelineID(
+              "compact",
+              index * 1000 + segmentIndex,
+              JSON.stringify(aux.compact),
+              ex.timestamp,
+              ex.agent,
+            ),
         type: "compact",
         compactNotice: aux.compact,
         timestamp: ex.timestamp,
@@ -272,20 +320,22 @@ function buildAssistantTimeline(
       segmentIndex += 1;
     } else if (aux.toolcall) {
       const normalizedTool = normalizeToolCall(aux.toolcall);
-      out.push({
-        id:
-          normalizedTool.callId ||
-          stableTimelineID(
-            "tool",
-            index * 1000 + segmentIndex,
-            JSON.stringify(normalizedTool),
-            ex.timestamp,
-            ex.agent,
-          ),
-        type: "tool",
-        toolCall: normalizedTool,
-      });
-      segmentIndex += 1;
+      if (!isTaskListToolCall(normalizedTool)) {
+        out.push({
+          id: normalizedTool.callId
+            ? exchangeScopedID("tool", index, normalizedTool.callId)
+            : stableTimelineID(
+                "tool",
+                index * 1000 + segmentIndex,
+                JSON.stringify(normalizedTool),
+                ex.timestamp,
+                ex.agent,
+              ),
+          type: "tool",
+          toolCall: normalizedTool,
+        });
+        segmentIndex += 1;
+      }
     }
   }
 
@@ -330,7 +380,8 @@ function buildBaseTimeline(
     const content = ex.content || "";
     if (role === "user") {
       inferredSeq += 1;
-      const seq = Number(ex.seq || 0) > 0 ? Number(ex.seq || 0) : inferredSeq;
+      const persisted = Number(ex.seq || 0) > 0;
+      const seq = persisted ? Number(ex.seq || 0) : inferredSeq;
       if (!content) continue;
       out.push({
         id: stableTimelineID("user", index, content, ex.timestamp, ex.agent),
@@ -340,40 +391,46 @@ function buildBaseTimeline(
         agent: ex.agent,
         pendingAck: ex.pending_ack === true,
         seq,
+        persisted,
       });
       continue;
     }
     if (role === "agent" || role === "assistant") {
       inferredSeq += 1;
-      const seq = Number(ex.seq || 0) > 0 ? Number(ex.seq || 0) : inferredSeq;
+      const persisted = Number(ex.seq || 0) > 0;
+      const seq = persisted ? Number(ex.seq || 0) : inferredSeq;
       const auxList = seq ? exchangeAux[String(seq)] || [] : [];
-      out.push(...buildAssistantTimeline({ ...ex, seq }, index, auxList));
+      out.push(
+        ...buildAssistantTimeline({ ...ex, seq, persisted }, index, auxList),
+      );
       continue;
     }
     if (role === "thought") {
       if (!content) continue;
       out.push({
-        id:
-          ex.thought_id ||
-          stableTimelineID("thought", index, content, ex.timestamp, ex.agent),
+        id: ex.thought_id
+          ? exchangeScopedID("thought", index, ex.thought_id)
+          : stableTimelineID("thought", index, content, ex.timestamp, ex.agent),
         type: "thought",
         content,
+        thoughtId: ex.thought_id || undefined,
       });
       continue;
     }
     if (role === "tool") {
       if (!ex.toolCall) continue;
       const normalizedTool = normalizeToolCall(ex.toolCall);
+      if (isTaskListToolCall(normalizedTool)) continue;
       out.push({
-        id:
-          normalizedTool.callId ||
-          stableTimelineID(
-            "tool",
-            index,
-            JSON.stringify(normalizedTool),
-            ex.timestamp,
-            ex.agent,
-          ),
+        id: normalizedTool.callId
+          ? exchangeScopedID("tool", index, normalizedTool.callId)
+          : stableTimelineID(
+              "tool",
+              index,
+              JSON.stringify(normalizedTool),
+              ex.timestamp,
+              ex.agent,
+            ),
         type: "tool",
         toolCall: normalizedTool,
       });
@@ -395,10 +452,28 @@ function buildBaseTimeline(
       });
       continue;
     }
+    if (role === "tasks") {
+      if (!ex.tasksUpdate?.items?.length) continue;
+      out.push({
+        id: stableTimelineID(
+          "tasks",
+          index,
+          JSON.stringify(ex.tasksUpdate),
+          ex.timestamp,
+          ex.agent,
+        ),
+        type: "tasks",
+        tasksUpdate: ex.tasksUpdate,
+        timestamp: ex.timestamp,
+      });
+      continue;
+    }
     if (role === "plan") {
       if (!ex.planUpdate) continue;
       out.push({
-        id: ex.planUpdate.id || stableTimelineID("plan", index, ex.planUpdate.content || "", ex.timestamp, ex.agent),
+        id: ex.planUpdate.id
+          ? exchangeScopedID("plan", index, ex.planUpdate.id)
+          : stableTimelineID("plan", index, ex.planUpdate.content || "", ex.timestamp, ex.agent),
         type: "plan",
         planUpdate: ex.planUpdate,
         timestamp: ex.timestamp,
@@ -408,7 +483,9 @@ function buildBaseTimeline(
     if (role === "compact") {
       if (!ex.compactNotice) continue;
       out.push({
-        id: ex.compactNotice.id || stableTimelineID("compact", index, JSON.stringify(ex.compactNotice), ex.timestamp, ex.agent),
+        id: ex.compactNotice.id
+          ? exchangeScopedID("compact", index, ex.compactNotice.id)
+          : stableTimelineID("compact", index, JSON.stringify(ex.compactNotice), ex.timestamp, ex.agent),
         type: "compact",
         compactNotice: ex.compactNotice,
         timestamp: ex.timestamp,
@@ -427,7 +504,9 @@ function applySessionContextWindow(
     0,
     Number(contextWindow?.modelContextWindow || 0),
   );
-  if (!totalTokens || !modelContextWindow) {
+  // Subagent sessions only know their used tokens, not the model window. The
+  // badge component already renders that intermediate state, so stamp it.
+  if (!totalTokens) {
     return items;
   }
   for (let i = items.length - 1; i >= 0; i -= 1) {
@@ -481,10 +560,6 @@ export function useSessionStream(
       setIsStreaming(false);
       return;
     }
-    setIsStreaming(
-      sessionPending && sessionService.isSessionStreaming(sessionKey),
-    );
-
     const unsubscribe = sessionService.subscribe(sessionKey, {
       onStream: (event) => {
         setStreamVersion((value) => value + 1);
@@ -496,7 +571,7 @@ export function useSessionStream(
         if (event.type === "message_chunk") {
           setStreamStatusText("");
         }
-        if (event.type === "message_done") {
+        if (event.type === "message_done" || event.type === "context_update") {
           return;
         }
         if (event.type === "error") {
@@ -516,6 +591,16 @@ export function useSessionStream(
       },
     });
 
+    // subscribe() replays events queued while this viewer was unmounted. If
+    // the turn finished during that time, those stale events would re-enter
+    // the generating state forever: recompute from the authoritative live
+    // stream flag, which session.done/session.error already cleared.
+    const streaming = sessionPending && sessionService.isSessionStreaming(sessionKey);
+    setIsStreaming(streaming);
+    if (!streaming) {
+      setStreamStatusText("");
+    }
+
     return () => {
       unsubscribe();
     };
@@ -525,10 +610,36 @@ export function useSessionStream(
   // viewer's tail-following effect.
   const timeline = useMemo(() => settleRunningTools(baseTimeline), [baseTimeline]);
 
+  const latestTaskList = useMemo(() => {
+    let latest: TaskListUpdate | null = null;
+    for (const ex of exchanges) {
+      const role = normalizeRole(ex.role);
+      if (role === "tasks") {
+        if (ex.tasksUpdate) latest = ex.tasksUpdate;
+        continue;
+      }
+      if (role !== "agent" && role !== "assistant") continue;
+      const seq = Number(ex.seq || 0);
+      if (!seq) continue;
+      const auxList = exchangeAux[String(seq)] || [];
+      let latestLine = -1;
+      for (const aux of auxList) {
+        if (!aux.tasks) continue;
+        const line = Math.max(0, Number(aux.line || 0));
+        if (line >= latestLine) {
+          latest = aux.tasks;
+          latestLine = line;
+        }
+      }
+    }
+    return latest;
+  }, [exchanges, exchangeAux]);
+
   return {
     timeline,
     isStreaming,
     streamVersion,
     streamStatusText,
+    latestTaskList,
   };
 }

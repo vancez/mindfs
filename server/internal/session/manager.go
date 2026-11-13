@@ -560,7 +560,7 @@ func (m *Manager) AddExchangeAux(_ context.Context, sessionKey string, aux Excha
 	if aux.Seq <= 0 {
 		return errors.New("aux seq required")
 	}
-	if aux.ToolCall == nil && strings.TrimSpace(aux.Thought) == "" && aux.Todo == nil && aux.Plan == nil && aux.Compact == nil {
+	if aux.ToolCall == nil && strings.TrimSpace(aux.Thought) == "" && aux.Todo == nil && aux.Tasks == nil && aux.Plan == nil && aux.Compact == nil {
 		return errors.New("aux content required")
 	}
 	m.mu.Lock()
@@ -1916,7 +1916,9 @@ func sessionMetaUpsertArgs(session *Session) ([]any, error) {
 }
 
 func validContextWindow(contextWindow agenttypes.ContextWindow) bool {
-	return contextWindow.TotalTokens > 0 && contextWindow.ModelContextWindow > 0
+	// Subagents report used tokens without a model window, so persist that
+	// intermediate state instead of dropping it.
+	return contextWindow.TotalTokens > 0
 }
 
 func boolToSQLiteInt(value bool) int {

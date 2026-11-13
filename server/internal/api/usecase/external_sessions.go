@@ -407,19 +407,37 @@ func syncImportedSubagentSessions(
 			}
 			var child *session.Session
 			start := 0
+			adoptedCtxSeq := -1
 			if binding == nil {
-				name := strings.TrimSpace(item.Title)
-				if name == "" {
-					name = "Subagent"
+				adopted, lookupErr := findSubagentChildByParentToolCall(ctx, manager, parent, item.ParentToolCallID)
+				if lookupErr != nil {
+					return importedCount, lookupErr
 				}
-				child, err = manager.Create(ctx, session.CreateInput{
-					Type:             session.TypeChat,
-					ParentSessionKey: parent.Key,
-					ParentToolCallID: strings.TrimSpace(item.ParentToolCallID),
-					Agent:            agentName,
-					Model:            strings.TrimSpace(item.Model),
-					Name:             name,
-				})
+				if seededLiveSubagent(adopted) {
+					// The live router already streamed this subagent into a
+					// child session. Bind it to the real external id instead of
+					// creating a second child for the same parent tool call, and
+					// only append imported history it does not have yet.
+					child = adopted
+					start = len(adopted.Exchanges)
+					if len(item.Exchanges) < start {
+						start = len(item.Exchanges)
+					}
+					adoptedCtxSeq = len(item.Exchanges)
+				} else {
+					name := strings.TrimSpace(item.Title)
+					if name == "" {
+						name = "Subagent"
+					}
+					child, err = manager.Create(ctx, session.CreateInput{
+						Type:             session.TypeChat,
+						ParentSessionKey: parent.Key,
+						ParentToolCallID: strings.TrimSpace(item.ParentToolCallID),
+						Agent:            agentName,
+						Model:            strings.TrimSpace(item.Model),
+						Name:             name,
+					})
+				}
 			} else {
 				child, err = manager.Get(ctx, binding.SessionKey, 0)
 				start = binding.AgentCtxSeq
@@ -445,7 +463,11 @@ func syncImportedSubagentSessions(
 			if err != nil {
 				return importedCount, err
 			}
-			if err := manager.UpdateAgentState(ctx, latest, agentName, len(latest.Exchanges), agentSessionID); err != nil {
+			nextCtxSeq := len(latest.Exchanges)
+			if adoptedCtxSeq > nextCtxSeq {
+				nextCtxSeq = adoptedCtxSeq
+			}
+			if err := manager.UpdateAgentState(ctx, latest, agentName, nextCtxSeq, agentSessionID); err != nil {
 				return importedCount, err
 			}
 			if item.Cursor.SourcePath != "" {
@@ -462,6 +484,38 @@ func syncImportedSubagentSessions(
 		pending = next
 	}
 	return importedCount, nil
+}
+
+// findSubagentChildByParentToolCall returns the direct child created for a
+// subagent invocation. The live router keys children by the parent tool call,
+// which is the only identifier shared with the imported subagent log.
+func findSubagentChildByParentToolCall(
+	ctx context.Context,
+	manager *session.Manager,
+	parent *session.Session,
+	parentToolCallID string,
+) (*session.Session, error) {
+	parentToolCallID = strings.TrimSpace(parentToolCallID)
+	if parent == nil || parentToolCallID == "" {
+		return nil, nil
+	}
+	children, err := manager.List(ctx, session.ListOptions{ParentSessionKey: parent.Key})
+	if err != nil {
+		return nil, err
+	}
+	for _, child := range children {
+		if child != nil && strings.TrimSpace(child.ParentToolCallID) == parentToolCallID {
+			return child, nil
+		}
+	}
+	return nil, nil
+}
+
+// seededLiveSubagent reports whether the child was created by the live Claude
+// subagent router and starts with the task prompt. Older synthetic children
+// only hold the streamed reply and are left untouched.
+func seededLiveSubagent(child *session.Session) bool {
+	return child != nil && len(child.Exchanges) > 0 && child.Exchanges[0].Role == "user"
 }
 
 func externalSessionDeltaAfterCtxSeq(exchanges []agenttypes.ImportedExchange, agentCtxSeq int) []agenttypes.ImportedExchange {

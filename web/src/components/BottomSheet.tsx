@@ -50,6 +50,8 @@ export function BottomSheet({
     // AppShell's main (contain: paint) is the fixed-position containing block.
     // Cap the original height to its available space when the IME shrinks it.
     maxHeight: "100%",
+    // Keep the last row of content clear of the system navigation bar.
+    paddingBottom: "var(--mindfs-safe-area-bottom, 0px)",
     borderTopLeftRadius: "20px",
     borderTopRightRadius: "20px",
     transform: isOpen ? "translateY(0)" : "translateY(100%)",

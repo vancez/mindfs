@@ -80,6 +80,7 @@ func main() {
 	noRelayer := flag.Bool("no-relayer", false, "disable relay integration")
 	e2eeFlag := flag.Bool("e2ee", false, "enable end-to-end encryption for sensitive data")
 	webPushFlag := flag.Bool("web-push", true, "enable PWA Web Push notifications")
+	noBrowserFlag := flag.Bool("no-browser", false, "do not open the web UI in a browser")
 	foreground := flag.Bool("foreground", false, "run in the foreground instead of as a background service")
 	autoStart := flag.Bool("autostart", false, "register or refresh automatic startup for this user")
 	internalAutoStartFlag := flag.Bool("internal-autostart", false, "internal flag used by the automatic startup entry")
@@ -122,7 +123,7 @@ func main() {
 		fmt.Fprintln(os.Stderr, err.Error())
 		os.Exit(1)
 	}
-	applyStartupConfig(startupCfg, explicitFlags, addr, noRelayer, e2eeFlag, webPushFlag, foreground, bindRelay, tlsFlag, certFlag, keyFlag, agentConfigFlag, notifyScriptFlag)
+	applyStartupConfig(startupCfg, explicitFlags, addr, noRelayer, e2eeFlag, webPushFlag, noBrowserFlag, foreground, bindRelay, tlsFlag, certFlag, keyFlag, agentConfigFlag, notifyScriptFlag)
 	internalAutoStart := autoStartBoot || *internalAutoStartFlag
 	if internalAutoStart {
 		*foreground = true
@@ -327,7 +328,7 @@ func main() {
 				fmt.Fprintln(os.Stderr, err.Error())
 				os.Exit(1)
 			}
-		} else if !internalAutoStart {
+		} else if shouldOpenBrowser(*noBrowserFlag, internalAutoStart) {
 			if err := openTarget(*addr, clientTLS, rootID); err != nil {
 				reportOpenTargetError(os.Stderr, err)
 			}
@@ -385,8 +386,10 @@ func main() {
 				fmt.Fprintln(os.Stderr, err.Error())
 				os.Exit(1)
 			}
-		} else if err := openTarget(*addr, *tlsFlag, rootID); err != nil {
-			reportOpenTargetError(os.Stderr, err)
+		} else if shouldOpenBrowser(*noBrowserFlag, false) {
+			if err := openTarget(*addr, *tlsFlag, rootID); err != nil {
+				reportOpenTargetError(os.Stderr, err)
+			}
 		}
 		fmt.Fprintf(os.Stdout, "logs: %s\n", logPath)
 		return
@@ -447,8 +450,10 @@ func main() {
 				fmt.Fprintln(os.Stderr, err.Error())
 				os.Exit(1)
 			}
-		} else if err := openTarget(*addr, *tlsFlag, rootID); err != nil {
-			reportOpenTargetError(os.Stderr, err)
+		} else if shouldOpenBrowser(*noBrowserFlag, false) {
+			if err := openTarget(*addr, *tlsFlag, rootID); err != nil {
+				reportOpenTargetError(os.Stderr, err)
+			}
 		}
 	}
 
@@ -526,6 +531,8 @@ type startupConfig struct {
 	E2EE          *bool   `json:"e2ee"`
 	WebPush       *bool   `json:"webPush"`
 	WebPushFlag   *bool   `json:"web-push"`
+	NoBrowser     *bool   `json:"noBrowser"`
+	NoBrowserFlag *bool   `json:"no-browser"`
 	Foreground    *bool   `json:"foreground"`
 	BindRelay     *bool   `json:"bindRelay"`
 	BindRelayFlag *bool   `json:"bind-relay"`
@@ -567,6 +574,7 @@ func applyStartupConfig(
 	noRelayer *bool,
 	e2ee *bool,
 	webPush *bool,
+	noBrowser *bool,
 	foreground *bool,
 	bindRelay *bool,
 	tlsFlag *bool,
@@ -586,6 +594,9 @@ func applyStartupConfig(
 	}
 	if value := firstBool(cfg.WebPush, cfg.WebPushFlag); value != nil && !explicit["web-push"] {
 		*webPush = *value
+	}
+	if value := firstBool(cfg.NoBrowser, cfg.NoBrowserFlag); value != nil && !explicit["no-browser"] {
+		*noBrowser = *value
 	}
 	if cfg.Foreground != nil && !explicit["foreground"] {
 		*foreground = *cfg.Foreground
@@ -1165,6 +1176,12 @@ func printRelayBindTarget(w io.Writer, addr string, useTLS bool, rootID string) 
 	fmt.Fprintln(w, "Open this URL in a browser to bind relay:")
 	fmt.Fprintln(w, u.String())
 	return nil
+}
+
+// shouldOpenBrowser reports whether this invocation should launch the web UI.
+// Both an explicit -no-browser and the automatic startup entry stay silent.
+func shouldOpenBrowser(noBrowser, internalAutoStart bool) bool {
+	return !noBrowser && !internalAutoStart
 }
 
 func openTarget(addr string, useTLS bool, rootID string) error {

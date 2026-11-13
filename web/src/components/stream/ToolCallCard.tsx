@@ -1,6 +1,7 @@
 import React, { memo, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { sessionService, type ToolCall, type ToolCallContentItem, type ToolCallLocation } from "../../services/session";
 import { MarkdownViewer } from "../MarkdownViewer";
+import { languageForPath } from "../codeHighlight";
 import { useI18n } from "../../i18n";
 
 type ToolCallCardProps = {
@@ -19,6 +20,7 @@ type ToolCallCardProps = {
   viewCache?: ToolCallViewCache;
   viewCacheKey?: string;
   getFallbackResult?: (toolCall: Partial<ToolCall>) => string;
+  onExpand?: () => void;
 };
 
 export type ToolCallViewCache = {
@@ -462,6 +464,7 @@ export const ToolCallCard = memo(function ToolCallCard({
   viewCache,
   viewCacheKey,
   getFallbackResult,
+  onExpand,
 }: ToolCallCardProps) {
   const { t } = useI18n();
   const expansionKey = viewCacheKey || _callId;
@@ -480,6 +483,14 @@ export const ToolCallCard = memo(function ToolCallCard({
   const detailScrollRef = useRef<HTMLDivElement | null>(null);
   const loadingDetailKeyRef = useRef("");
   const loadedDetailKeyRef = useRef("");
+  // Props signature the loaded payload was fetched for. Streaming updates
+  // replace meta/content objects without changing the call they describe, so
+  // the payload stays valid for the same call until its source changes.
+  const loadedSourceRef = useRef<{
+    meta?: Record<string, unknown>;
+    content?: ToolCallContentItem[];
+    status: string;
+  } | null>(null);
   const detailGenerationRef = useRef(0);
   const shouldStickDetailsToBottomRef = useRef(true);
   const effectiveKind = loadedToolCall?.kind || kind;
@@ -527,7 +538,26 @@ export const ToolCallCard = memo(function ToolCallCard({
   const hasUserShellOutput = userShellText.trim().length > 0;
   const hasCollabDetails = isCollabTool && !isCollabWait && Boolean(effectiveMeta?.prompt);
   const canLoadDetails = Boolean(rootId && sessionKey && _callId);
-  const needsRemoteDetails = canLoadDetails && (isUserShell ? !hasUserShellOutput : isExecute ? !hasExecuteOutput : !hasContent);
+  // Whether the remote details are the source of truth for this card. Derive
+  // this from the incoming props rather than the loaded snapshot: otherwise a
+  // successful load sets hasContent and the card stops refreshing, while the
+  // old reset-on-every-update code blanked it back to the loading row instead.
+  const sourceText = useMemo(
+    () => (content || []).map((item) => ("text" in item ? item.text || "" : "")).join(""),
+    [content],
+  );
+  // `result` is the fallback text the card can render on its own and is only
+  // computed while expanded, which is when remote details matter.
+  const sourceFallback = result || "";
+  const sourceHasDetails = isUserShell
+    ? sourceText.trim().length > 0 || sourceFallback.trim().length > 0
+    : isExecute
+    ? sourceText.trim().length > 0 ||
+      (sourceFallback.trim().length > 0 &&
+        sourceFallback !== stringMeta(meta, "input") &&
+        sourceFallback !== extractExecuteCommand(meta, labelTitle))
+    : !!(content && content.length > 0);
+  const needsRemoteDetails = canLoadDetails && !sourceHasDetails;
   const hasDetails =
     (isUserShell
       ? hasUserShellOutput || hasContent
@@ -538,7 +568,7 @@ export const ToolCallCard = memo(function ToolCallCard({
   const normalizedStatus = (effectiveStatus || "").toLowerCase();
   const detailSections = useMemo(() => {
     if (!expanded) return [];
-    const sections = buildDetailSections(effectiveContent, effectiveLocations, rootPath);
+    const sections = buildDetailSections(effectiveContent, effectiveLocations, rootPath, normalizedKind);
     if (sections.length > 0 || !result || !isDiffLikeText(result)) {
       return sections;
     }
@@ -550,12 +580,15 @@ export const ToolCallCard = memo(function ToolCallCard({
         markdown: `~~~diff\n${result.trim()}\n~~~`,
       },
     ];
-  }, [expanded, effectiveContent, effectiveLocations, result, rootPath]);
+  }, [expanded, effectiveContent, effectiveLocations, result, rootPath, normalizedKind]);
+  // Command output may contain a unified diff (e.g. `git diff`), but it is
+  // rendered as terminal output rather than a file-change section. Keep those
+  // cards on the normal background so highlighting stays consistent.
   const isFileChange =
     normalizedKind === "edit" ||
     normalizedKind === "delete" ||
     normalizedKind === "move" ||
-    detailSections.some((section) => section.type === "diff");
+    (!isExecute && detailSections.some((section) => section.type === "diff"));
   const fileNames = useMemo(() => {
     const diffNames = (effectiveContent || [])
       .map((item) => basename(normalizeDisplayPath(item.path || "", rootPath)))
@@ -590,7 +623,13 @@ export const ToolCallCard = memo(function ToolCallCard({
     }
   }, [defaultExpanded, hasDetails]);
 
+  // Details belong to a tool call, not to one snapshot of its props. Only a
+  // different call (or session) invalidates the loaded payload; an update to
+  // the same call keeps it on screen while the refresh below replaces it.
+  // Clearing it on every update collapsed the expanded card to its loading
+  // row, so the transcript box grew and shrank on each chunk and bounced.
   useEffect(() => {
+    const detailKey = `${rootId || ""}::${sessionKey || ""}::${_callId}`;
     const cached = viewCache?.details.get(_callId);
     const valid = cached?.source === meta && cached?.content === content && cached?.status === status;
     detailGenerationRef.current += 1;
@@ -598,18 +637,36 @@ export const ToolCallCard = memo(function ToolCallCard({
     setDetailLoadFailed(false);
     setLoadingDetails(false);
     loadingDetailKeyRef.current = "";
-    loadedDetailKeyRef.current = valid ? `${rootId || ""}::${sessionKey || ""}::${_callId}` : "";
+    loadedDetailKeyRef.current = valid ? detailKey : "";
+    loadedSourceRef.current = valid ? { meta, content, status } : null;
     return () => { detailGenerationRef.current += 1; };
-  }, [_callId, rootId, sessionKey, meta, content, status, viewCache]);
+    // Keyed by the call identity on purpose: streaming replaces meta/content
+    // objects without changing which call the loaded details describe.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [_callId, rootId, sessionKey, viewCache]);
 
   useEffect(() => {
     if (!expanded || !needsRemoteDetails) return;
     const detailKey = `${rootId || ""}::${sessionKey || ""}::${_callId}`;
-    if (loadedDetailKeyRef.current === detailKey || loadingDetailKeyRef.current === detailKey) return;
+    if (loadingDetailKeyRef.current === detailKey) return;
+    const loaded = loadedDetailKeyRef.current === detailKey;
+    const source = loadedSourceRef.current;
+    const stale =
+      !loaded ||
+      !source ||
+      source.meta !== meta ||
+      source.content !== content ||
+      source.status !== status;
+    if (!stale) return;
     loadingDetailKeyRef.current = detailKey;
     const generation = detailGenerationRef.current;
-    setLoadingDetails(true);
+    // Only surface the loading row when there is nothing to show yet. A
+    // refresh of already-visible details must not shrink the card.
+    if (!loaded) {
+      setLoadingDetails(true);
+    }
     setDetailLoadFailed(false);
+    const requestSource = { meta, content, status };
     sessionService
       .getToolCall(String(rootId || ""), String(sessionKey || ""), _callId)
       .then((toolCall) => {
@@ -627,12 +684,15 @@ export const ToolCallCard = memo(function ToolCallCard({
           }
           setLoadedToolCall(toolCall);
           loadedDetailKeyRef.current = detailKey;
-        } else {
+          loadedSourceRef.current = requestSource;
+        } else if (!loaded) {
           setDetailLoadFailed(true);
         }
       })
       .catch(() => {
-        if (generation === detailGenerationRef.current && loadingDetailKeyRef.current === detailKey) setDetailLoadFailed(true);
+        if (generation === detailGenerationRef.current && loadingDetailKeyRef.current === detailKey && !loaded) {
+          setDetailLoadFailed(true);
+        }
       })
       .finally(() => {
         if (generation !== detailGenerationRef.current || loadingDetailKeyRef.current !== detailKey) return;
@@ -678,7 +738,15 @@ export const ToolCallCard = memo(function ToolCallCard({
     >
       <button
         type="button"
-        onClick={hasDetails ? () => setExpanded(!expanded) : undefined}
+        onClick={
+          hasDetails
+            ? () => {
+                const next = !expanded;
+                setExpanded(next);
+                if (next) onExpand?.();
+              }
+            : undefined
+        }
         style={{
           width: "100%",
           display: "flex",
@@ -963,7 +1031,12 @@ function normalizeDisplayPath(path: string, rootPath?: string): string {
   return path;
 }
 
-function buildDetailSections(content?: ToolCallContentItem[], locations?: ToolCallLocation[], rootPath?: string): DetailSection[] {
+function buildDetailSections(
+  content?: ToolCallContentItem[],
+  locations?: ToolCallLocation[],
+  rootPath?: string,
+  kind?: string,
+): DetailSection[] {
   if (!content || content.length === 0) return [];
   const sections: DetailSection[] = [];
   let locationIndex = 0;
@@ -977,6 +1050,15 @@ function buildDetailSections(content?: ToolCallContentItem[], locations?: ToolCa
     if (item.type === "text" && item.text?.trim()) {
       const fallbackPath = normalizeDisplayPath(locations?.[locationIndex]?.path || "(unknown)", rootPath);
       const path = normalizeDisplayPath(item.path || fallbackPath, rootPath);
+      if (kind === "read") {
+        // Read returns raw file text. Rendering it as Markdown turns tabs into
+        // indented code blocks and mangles source code, so show it verbatim in
+        // a fenced code block (highlighted by file extension).
+        const sourcePath = item.path || locations?.[locationIndex]?.path;
+        sections.push({ type: "text", markdown: renderVerbatimCode(item.text, sourcePath) });
+        locationIndex += 1;
+        continue;
+      }
       if (item.changeKind === "add") {
         sections.push({ type: "diff", path, markdown: renderAddedText(path, item.text) });
         locationIndex += 1;
@@ -1000,4 +1082,11 @@ function buildDetailSections(content?: ToolCallContentItem[], locations?: ToolCa
     }
   }
   return sections;
+}
+
+function renderVerbatimCode(text: string, path?: string): string {
+  const language = languageForPath(path || "");
+  const longestFence = (text.match(/`+/g) || []).reduce((longest, run) => Math.max(longest, run.length), 0);
+  const fence = "`".repeat(Math.max(3, longestFence + 1));
+  return `${fence}${language}\n${text}\n${fence}`;
 }

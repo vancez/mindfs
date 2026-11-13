@@ -963,21 +963,24 @@ type DeleteSessionInput struct {
 	KeepChildren bool
 }
 
-func (s *Service) DeleteSession(ctx context.Context, in DeleteSessionInput) error {
+// DeleteSession removes a session (and, unless KeepChildren is set, its
+// descendant sessions). It returns every deleted session key so callers can
+// notify other connected clients.
+func (s *Service) DeleteSession(ctx context.Context, in DeleteSessionInput) ([]string, error) {
 	if err := s.ensureRegistry(); err != nil {
-		return err
+		return nil, err
 	}
 	root, err := s.Registry.GetRoot(in.RootID)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	manager, err := s.Registry.GetSessionManager(in.RootID)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	keys, err := deleteSessionCascadeKeys(ctx, manager, in.Key)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if in.KeepChildren {
 		keys = []string{strings.TrimSpace(in.Key)}
@@ -990,11 +993,11 @@ func (s *Service) DeleteSession(ctx context.Context, in DeleteSessionInput) erro
 	}); ok {
 		executionKeys, err := cleaner.DeleteSessionTaskGroups(ctx, in.RootID, keys)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		metas, err := manager.ListMetas(ctx)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		existing := map[string]bool{}
 		for _, meta := range metas {
@@ -1015,7 +1018,7 @@ func (s *Service) DeleteSession(ctx context.Context, in DeleteSessionInput) erro
 			}
 			children, err := deleteSessionCascadeKeys(ctx, manager, key)
 			if err != nil {
-				return err
+				return nil, err
 			}
 			for _, child := range children {
 				if !seen[child] {
@@ -1027,22 +1030,22 @@ func (s *Service) DeleteSession(ctx context.Context, in DeleteSessionInput) erro
 	}
 	if in.KeepChildren {
 		if err := manager.DetachChildren(ctx, in.Key); err != nil {
-			return err
+			return nil, err
 		}
 	}
 	for _, key := range keys {
 		cancelActiveSessionTurn(in.RootID, key)
 
 		if err := manager.Delete(ctx, key); err != nil {
-			return err
+			return nil, err
 		}
 		if err := root.RemoveSessionFileMeta(key); err != nil {
-			return err
+			return nil, err
 		}
 		commandexec.CloseSession(in.RootID, key)
 		s.Registry.ReleaseFileWatcher(in.RootID, key)
 	}
-	return nil
+	return keys, nil
 }
 
 func deleteSessionCascadeKeys(ctx context.Context, manager *session.Manager, key string) ([]string, error) {
@@ -1915,6 +1918,34 @@ func buildPluginPromptInitial(catalogPrompt, userMessage, pluginDir string) stri
 	}, "\n")
 }
 
+// latestTaskListSnapshot returns the most recent persisted task-list snapshot,
+// used to seed a resumed agent session so its next snapshot is complete.
+func latestTaskListSnapshot(ctx context.Context, manager *session.Manager, key string) *agenttypes.TaskListUpdate {
+	if manager == nil || strings.TrimSpace(key) == "" {
+		return nil
+	}
+	auxBySeq, err := manager.GetExchangeAux(ctx, key, 0)
+	if err != nil {
+		return nil
+	}
+	seqs := make([]int, 0, len(auxBySeq))
+	for seq := range auxBySeq {
+		seqs = append(seqs, seq)
+	}
+	sort.Ints(seqs)
+	var latest *agenttypes.TaskListUpdate
+	for _, seq := range seqs {
+		for _, aux := range auxBySeq[seq] {
+			if aux.Tasks == nil {
+				continue
+			}
+			snapshot := agenttypes.TaskListUpdate{Items: append([]agenttypes.TaskItem(nil), aux.Tasks.Items...)}
+			latest = &snapshot
+		}
+	}
+	return latest
+}
+
 func (s *Service) ensureAgentSession(
 	ctx context.Context,
 	pool *agent.Pool,
@@ -2009,6 +2040,11 @@ func (s *Service) ensureAgentSession(
 		openCtx = ctx
 	}
 
+	var initialTaskList *agenttypes.TaskListUpdate
+	if manager != nil && current != nil && len(current.Exchanges) > 0 {
+		initialTaskList = latestTaskListSnapshot(ctx, manager, current.Key)
+	}
+
 	openInput := agenttypes.OpenSessionInput{
 		SessionKey:            poolSessionKey,
 		AgentName:             agentName,
@@ -2019,6 +2055,7 @@ func (s *Service) ensureAgentSession(
 		PlanMode:              nextPlanMode,
 		RootPath:              rootAbs,
 		DeveloperInstructions: developerInstructions,
+		InitialTaskList:       initialTaskList,
 		AgentSessionID: strings.TrimSpace(func() string {
 			if binding == nil {
 				return ""
@@ -2279,6 +2316,7 @@ func (s *Service) SendMessage(ctx context.Context, in SendMessageInput) error {
 	defer manager.ClearPendingExchangeAux(context.Background(), current.Key)
 	var thoughtBuffer strings.Builder
 	currentThoughtID := ""
+	seenToolCalls := make(map[string]bool)
 	flushThought := func() {
 		thought := thoughtBuffer.String()
 		if strings.TrimSpace(thought) == "" {
@@ -2326,8 +2364,10 @@ func (s *Service) SendMessage(ctx context.Context, in SendMessageInput) error {
 					update.Data = chunk
 					thoughtBuffer.WriteString(chunk.Content)
 				}
-			case agenttypes.EventTypeToolCall, agenttypes.EventTypeToolUpdate, agenttypes.EventTypeTodoUpdate, agenttypes.EventTypePlanUpdate, agenttypes.EventTypeCompact, agenttypes.EventTypeMessageChunk, agenttypes.EventTypeMessageDone:
-				flushThought()
+			default:
+				if isThoughtBoundary(update, seenToolCalls) {
+					flushThought()
+				}
 			}
 			clientUpdate := compactAgentUpdate(update)
 			if update.Type == agenttypes.EventTypeToolCall || update.Type == agenttypes.EventTypeToolUpdate {
@@ -2392,6 +2432,16 @@ func (s *Service) SendMessage(ctx context.Context, in SendMessageInput) error {
 					})
 				}
 			}
+			if update.Type == agenttypes.EventTypeTaskUpdate {
+				if tasks, ok := update.Data.(agenttypes.TaskListUpdate); ok {
+					tasksCopy := agenttypes.TaskListUpdate{Items: append([]agenttypes.TaskItem(nil), tasks.Items...)}
+					auxBuffer = append(auxBuffer, session.ExchangeAux{
+						Seq:   plannedAssistantSeq,
+						Line:  currentAssistantLine(responseText),
+						Tasks: &tasksCopy,
+					})
+				}
+			}
 			if update.Type == agenttypes.EventTypeCompact {
 				if compact, ok := update.Data.(agenttypes.CompactNotice); ok {
 					compactCopy := compact
@@ -2417,6 +2467,7 @@ func (s *Service) SendMessage(ctx context.Context, in SendMessageInput) error {
 				update.Type == agenttypes.EventTypeToolCall ||
 				update.Type == agenttypes.EventTypeToolUpdate ||
 				update.Type == agenttypes.EventTypeTodoUpdate ||
+				update.Type == agenttypes.EventTypeTaskUpdate ||
 				update.Type == agenttypes.EventTypePlanUpdate ||
 				update.Type == agenttypes.EventTypeCompact {
 				lastResponseUpdateType = string(update.Type)
@@ -2635,9 +2686,20 @@ type subagentSessionInput struct {
 }
 
 type claudeSubagentRouter struct {
+	// Events arrive from the agent's stream consumer goroutine while FinishAll
+	// runs on the caller's goroutine, so the routing tables are guarded.
+	mu       sync.Mutex
 	in       subagentSessionInput
 	byRef    map[string]*claudeSyntheticSubagent
 	children []*claudeSyntheticSubagent
+	// pendingContext holds subagent usage that arrived before the child was
+	// materialized by a text/tool stream. It is keyed by parent tool use id
+	// and flushed when ensure() creates or loads the child.
+	pendingContext map[string]agenttypes.Event
+	// taskPrompts keeps the parent Agent/Task tool-call prompt per call id so
+	// the live child session can be seeded with the same user message the
+	// on-disk subagent log uses.
+	taskPrompts map[string]string
 }
 
 type claudeSyntheticSubagent struct {
@@ -2659,6 +2721,7 @@ func (r *claudeSubagentRouter) Handle(ctx context.Context, update agenttypes.Eve
 	if r == nil || r.in.Parent == nil || r.in.Manager == nil {
 		return false
 	}
+	r.rememberParentTaskPrompt(update)
 	if r.handleSubagentTerminalSummary(ctx, update) {
 		return false
 	}
@@ -2672,31 +2735,139 @@ func (r *claudeSubagentRouter) Handle(ctx context.Context, update agenttypes.Eve
 	if strings.TrimSpace(ref.ParentToolUseID) == "" && r.find(ref) == nil {
 		return false
 	}
+	// Usage updates can arrive before the first text/tool chunk materializes
+	// the child. Consume them regardless so they never leak into the parent;
+	// buffer until ensure() has a child to attach them to.
+	if update.Type == agenttypes.EventTypeContextUpdate {
+		r.routeContextUpdate(ref, update)
+		return true
+	}
+	// A progress/result update alone never identifies a subagent: children are
+	// materialized from message or tool-call streams. Without this guard, a
+	// long-running tool's heartbeat (which keeps parent_tool_use_id) would
+	// create a phantom child session named after the tool.
+	if update.Type == agenttypes.EventTypeToolUpdate && r.find(ref) == nil {
+		return false
+	}
 	child, err := r.ensure(ctx, ref, toolCallFromUpdate(update))
 	if err != nil {
 		log.Printf("[subagent/claude] session.ensure.error root=%s parent=%s ref=%s err=%v", r.in.RootID, r.in.Parent.Key, ref.key(), err)
 		return false
 	}
+	if child == nil {
+		return false
+	}
+	if r.isClosed(child) {
+		// A closed child still owns its ref; consume the update instead of
+		// letting it leak into the parent session.
+		return true
+	}
+	if update.Type == agenttypes.EventTypeMessageDone {
+		if !r.markClosed(child) {
+			return true
+		}
+	}
+	child.runtime.emit(update)
+	return true
+}
+
+func (r *claudeSubagentRouter) routeContextUpdate(ref claudeSubagentRef, update agenttypes.Event) {
+	if child := r.find(ref); child != nil && !r.isClosed(child) {
+		child.runtime.emit(update)
+		return
+	}
+	key := ref.key()
+	if key == "" {
+		return
+	}
+	r.mu.Lock()
+	if r.pendingContext == nil {
+		r.pendingContext = make(map[string]agenttypes.Event)
+	}
+	r.pendingContext[key] = update
+	r.mu.Unlock()
+}
+
+func (r *claudeSubagentRouter) flushPendingContext(child *claudeSyntheticSubagent, key string) {
+	if child == nil || key == "" {
+		return
+	}
+	r.mu.Lock()
+	update, ok := r.pendingContext[key]
+	if ok {
+		delete(r.pendingContext, key)
+	}
+	r.mu.Unlock()
+	if ok {
+		child.runtime.emit(update)
+	}
+}
+
+func (r *claudeSubagentRouter) isClosed(child *claudeSyntheticSubagent) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return child == nil || child.closed
+}
+
+func (r *claudeSubagentRouter) markClosed(child *claudeSyntheticSubagent) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	if child == nil || child.closed {
 		return false
 	}
-	child.runtime.emit(update)
-	if update.Type == agenttypes.EventTypeMessageDone {
-		child.closed = true
-	}
+	child.closed = true
 	return true
+}
+
+// rememberParentTaskPrompt records the prompt of an Agent/Task tool call so the
+// synthetic child can start with the same user message as the imported log.
+// The first non-empty prompt per call id wins.
+func (r *claudeSubagentRouter) rememberParentTaskPrompt(update agenttypes.Event) {
+	if update.Type != agenttypes.EventTypeToolCall && update.Type != agenttypes.EventTypeToolUpdate {
+		return
+	}
+	toolCall, ok := update.Data.(agenttypes.ToolCall)
+	if !ok || toolCall.Kind != agenttypes.ToolKindTask {
+		return
+	}
+	callID := firstNonEmptyString(toolCall.CallID, stringMeta(toolCall.Meta, "parentToolUseId"))
+	if callID == "" {
+		return
+	}
+	if _, exists := r.taskPrompts[callID]; exists {
+		return
+	}
+	prompt := stringMeta(toolCall.Meta, "prompt")
+	if prompt == "" && stringMeta(toolCall.Meta, "subtype") == "task_started" {
+		// Older CLI versions only carry the prompt as the card body.
+		for _, item := range toolCall.Content {
+			if value := strings.TrimSpace(item.Text); value != "" {
+				prompt = value
+				break
+			}
+		}
+	}
+	if prompt == "" {
+		return
+	}
+	if r.taskPrompts == nil {
+		r.taskPrompts = make(map[string]string)
+	}
+	r.taskPrompts[callID] = prompt
 }
 
 func (r *claudeSubagentRouter) FinishAll() {
 	if r == nil {
 		return
 	}
-	for _, child := range r.children {
-		if child == nil || child.closed {
+	r.mu.Lock()
+	children := append([]*claudeSyntheticSubagent(nil), r.children...)
+	r.mu.Unlock()
+	for _, child := range children {
+		if !r.markClosed(child) {
 			continue
 		}
 		child.done()
-		child.closed = true
 	}
 }
 
@@ -2725,7 +2896,7 @@ func (r *claudeSubagentRouter) handleSubagentTerminalSummary(ctx context.Context
 	if child == nil && toolCall.RawType == "subagent_result" {
 		child = r.onlyOpenChild()
 	}
-	if child == nil {
+	if child == nil || !r.markClosed(child) {
 		return false
 	}
 	if strings.TrimSpace(summary) != "" {
@@ -2736,12 +2907,13 @@ func (r *claudeSubagentRouter) handleSubagentTerminalSummary(ctx context.Context
 		})
 	}
 	child.runtime.emit(agenttypes.Event{Type: agenttypes.EventTypeMessageDone, SessionID: update.SessionID, Data: agenttypes.MessageDone{}})
-	child.closed = true
 	_ = ctx
 	return true
 }
 
 func (r *claudeSubagentRouter) onlyOpenChild() *claudeSyntheticSubagent {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	var found *claudeSyntheticSubagent
 	for _, child := range r.children {
 		if child == nil || child.closed {
@@ -2774,6 +2946,7 @@ func (r *claudeSubagentRouter) ensure(ctx context.Context, ref claudeSubagentRef
 		}
 		child := r.attach(loaded, ref)
 		r.bindKeys(child, keys)
+		r.flushPendingContext(child, primary)
 		return child, nil
 	}
 	parentToolCallID := firstNonEmptyString(ref.ParentToolUseID, sourceCallID(source), ref.TaskID)
@@ -2796,15 +2969,25 @@ func (r *claudeSubagentRouter) ensure(ctx context.Context, ref claudeSubagentRef
 	}); err != nil {
 		return nil, err
 	}
+	// Mirror the imported subagent log: the child starts with the task prompt
+	// as its user message instead of an agent-only transcript.
+	if prompt := r.taskPrompts[parentToolCallID]; prompt != "" {
+		if err := r.in.Manager.AddExchangeForAgent(ctx, child, "user", prompt, r.in.Agent, r.in.Mode, r.in.Effort, r.in.FastService); err != nil {
+			log.Printf("[subagent/claude] prompt.seed.error root=%s parent=%s child=%s err=%v", r.in.RootID, r.in.Parent.Key, child.Key, err)
+		}
+	}
 	attached := r.attach(child, ref)
 	r.bindKeys(attached, keys)
 	if r.in.OnCreated != nil {
 		r.in.OnCreated(child)
 	}
+	r.flushPendingContext(attached, primary)
 	return attached, nil
 }
 
 func (r *claudeSubagentRouter) find(ref claudeSubagentRef) *claudeSyntheticSubagent {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	for _, key := range ref.keys() {
 		if child := r.byRef[key]; child != nil {
 			return child
@@ -2814,7 +2997,10 @@ func (r *claudeSubagentRouter) find(ref claudeSubagentRef) *claudeSyntheticSubag
 }
 
 func (r *claudeSubagentRouter) attach(child *session.Session, ref claudeSubagentRef) *claudeSyntheticSubagent {
-	runtime := &syntheticAgentSession{id: firstNonEmptyString(ref.ParentToolUseID, ref.TaskID, child.Key)}
+	// Keep the runtime id in the same namespace as the binding created in
+	// ensure(): finish() persists it through UpdateAgentState, and a raw tool id
+	// would overwrite the external "claude-subagent:<id>" identity.
+	runtime := &syntheticAgentSession{id: "claude-subagent:" + firstNonEmptyString(ref.ParentToolUseID, ref.TaskID, child.Key)}
 	in := r.in
 	done := attachBackgroundSessionUpdates(context.Background(), in, child, runtime)
 	attached := &claudeSyntheticSubagent{
@@ -2823,11 +3009,15 @@ func (r *claudeSubagentRouter) attach(child *session.Session, ref claudeSubagent
 		runtime: runtime,
 		done:    done,
 	}
+	r.mu.Lock()
 	r.children = append(r.children, attached)
+	r.mu.Unlock()
 	return attached
 }
 
 func (r *claudeSubagentRouter) bindKeys(child *claudeSyntheticSubagent, keys []string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	for _, key := range keys {
 		if key != "" {
 			r.byRef[key] = child
@@ -2878,6 +3068,13 @@ func claudeSubagentRefFromUpdate(update agenttypes.Event) claudeSubagentRef {
 			TaskDescription: data.TaskDescription,
 		}
 	case agenttypes.MessageDone:
+		return claudeSubagentRef{
+			ParentToolUseID: data.ParentToolUseID,
+			TaskID:          data.TaskID,
+			SubagentType:    data.SubagentType,
+			TaskDescription: data.TaskDescription,
+		}
+	case agenttypes.ContextUpdate:
 		return claudeSubagentRef{
 			ParentToolUseID: data.ParentToolUseID,
 			TaskID:          data.TaskID,
@@ -3082,7 +3279,34 @@ func attachBackgroundSessionUpdates(ctx context.Context, in subagentSessionInput
 	lastResponseUpdateType := ""
 	var doneMu sync.Mutex
 	doneSent := false
+	// Usage arrives from the child runtime's stream while finish() may run on
+	// the subscription/caller goroutine, so the latest values are guarded.
+	var usageMu sync.Mutex
+	var lastContextWindow agenttypes.ContextWindow
+	var lastTokenUsage *agenttypes.TokenUsage
+	recordUsage := func(contextWindow agenttypes.ContextWindow, usage *agenttypes.TokenUsage) {
+		usageMu.Lock()
+		defer usageMu.Unlock()
+		if contextWindow.TotalTokens > 0 {
+			lastContextWindow = contextWindow
+		}
+		if usage != nil {
+			copy := *usage
+			lastTokenUsage = &copy
+		}
+	}
+	takeUsage := func() (agenttypes.ContextWindow, *agenttypes.TokenUsage) {
+		usageMu.Lock()
+		defer usageMu.Unlock()
+		var usageCopy *agenttypes.TokenUsage
+		if lastTokenUsage != nil {
+			copy := *lastTokenUsage
+			usageCopy = &copy
+		}
+		return lastContextWindow, usageCopy
+	}
 	currentThoughtID := ""
+	seenToolCalls := make(map[string]bool)
 	flushThought := func() {
 		thought := thoughtBuffer.String()
 		if strings.TrimSpace(thought) == "" {
@@ -3110,7 +3334,9 @@ func attachBackgroundSessionUpdates(ctx context.Context, in subagentSessionInput
 		doneMu.Unlock()
 		defer in.Manager.ClearPendingExchangeAux(context.Background(), child.Key)
 		flushThought()
-		if err := in.Manager.AddExchangeForAgent(ctx, child, "agent", responseText, in.Agent, in.Mode, in.Effort, in.FastService); err != nil {
+		contextWindow, tokenUsage := takeUsage()
+		exchangeCtx := session.WithExchangeTokenUsage(ctx, tokenUsage)
+		if err := in.Manager.AddExchangeForAgent(exchangeCtx, child, "agent", responseText, in.Agent, in.Mode, in.Effort, in.FastService); err != nil {
 			log.Printf("[subagent] persist.agent.error root=%s session=%s err=%v", in.RootID, child.Key, err)
 			return
 		}
@@ -3121,11 +3347,19 @@ func attachBackgroundSessionUpdates(ctx context.Context, in subagentSessionInput
 				return
 			}
 		}
+		if contextWindow.TotalTokens > 0 {
+			if err := in.Manager.UpdateLastContextWindow(ctx, child, contextWindow); err != nil {
+				log.Printf("[subagent] persist.context_window.error root=%s session=%s err=%v", in.RootID, child.Key, err)
+			}
+		}
 		if err := in.Manager.UpdateAgentState(ctx, child, in.Agent, contextLineCount(child.Exchanges), runtime.SessionID()); err != nil {
 			log.Printf("[subagent] persist.agent_state.error root=%s session=%s err=%v", in.RootID, child.Key, err)
 		}
 		if emit && in.OnUpdate != nil {
-			in.OnUpdate(child.Key, agenttypes.Event{Type: agenttypes.EventTypeMessageDone, Data: agenttypes.MessageDone{}})
+			in.OnUpdate(child.Key, agenttypes.Event{
+				Type: agenttypes.EventTypeMessageDone,
+				Data: agenttypes.MessageDone{ContextWindow: contextWindow, TokenUsage: tokenUsage},
+			})
 		}
 	}
 	runtime.OnUpdate(func(update agenttypes.Event) {
@@ -3139,8 +3373,27 @@ func attachBackgroundSessionUpdates(ctx context.Context, in subagentSessionInput
 				update.Data = chunk
 				thoughtBuffer.WriteString(chunk.Content)
 			}
-		case agenttypes.EventTypeToolCall, agenttypes.EventTypeToolUpdate, agenttypes.EventTypeTodoUpdate, agenttypes.EventTypePlanUpdate, agenttypes.EventTypeCompact, agenttypes.EventTypeMessageChunk, agenttypes.EventTypeMessageDone:
-			flushThought()
+		default:
+			if isThoughtBoundary(update, seenToolCalls) {
+				flushThought()
+			}
+		}
+		if update.Type == agenttypes.EventTypeContextUpdate {
+			if contextUpdate, ok := update.Data.(agenttypes.ContextUpdate); ok {
+				recordUsage(contextUpdate.ContextWindow, contextUpdate.TokenUsage)
+			}
+		}
+		if update.Type == agenttypes.EventTypeMessageDone {
+			done, _ := update.Data.(agenttypes.MessageDone)
+			recordUsage(done.ContextWindow, done.TokenUsage)
+			contextWindow, tokenUsage := takeUsage()
+			if done.ContextWindow.TotalTokens <= 0 {
+				done.ContextWindow = contextWindow
+			}
+			if done.TokenUsage == nil {
+				done.TokenUsage = tokenUsage
+			}
+			update.Data = done
 		}
 		clientUpdate := compactAgentUpdate(update)
 		if update.Type == agenttypes.EventTypeToolCall || update.Type == agenttypes.EventTypeToolUpdate {
@@ -3176,6 +3429,16 @@ func attachBackgroundSessionUpdates(ctx context.Context, in subagentSessionInput
 				})
 			}
 		}
+		if update.Type == agenttypes.EventTypeTaskUpdate {
+			if tasks, ok := update.Data.(agenttypes.TaskListUpdate); ok {
+				tasksCopy := agenttypes.TaskListUpdate{Items: append([]agenttypes.TaskItem(nil), tasks.Items...)}
+				auxBuffer = append(auxBuffer, session.ExchangeAux{
+					Seq:   plannedAssistantSeq,
+					Line:  currentAssistantLine(responseText),
+					Tasks: &tasksCopy,
+				})
+			}
+		}
 		if update.Type == agenttypes.EventTypeCompact {
 			if compact, ok := update.Data.(agenttypes.CompactNotice); ok {
 				compactCopy := compact
@@ -3195,6 +3458,7 @@ func attachBackgroundSessionUpdates(ctx context.Context, in subagentSessionInput
 			update.Type == agenttypes.EventTypeToolCall ||
 			update.Type == agenttypes.EventTypeToolUpdate ||
 			update.Type == agenttypes.EventTypeTodoUpdate ||
+			update.Type == agenttypes.EventTypeTaskUpdate ||
 			update.Type == agenttypes.EventTypePlanUpdate ||
 			update.Type == agenttypes.EventTypeCompact {
 			lastResponseUpdateType = string(update.Type)
@@ -3576,21 +3840,42 @@ func (s *Service) AnswerQuestion(ctx context.Context, in AnswerQuestionInput) er
 	if pool == nil {
 		return errors.New("agent pool unavailable")
 	}
-	sess, ok := pool.Get(agentPoolSessionKey(sessionKey, agentName))
-	if !ok {
-		return errors.New("agent session not found")
+	sess, err := resolveAnswerRuntimeSession(ctx, manager, sessionKey, agentName, pool)
+	if err != nil {
+		return err
 	}
 	answer := agenttypes.AskUserAnswer{
 		ToolUseID: strings.TrimSpace(in.ToolUseID),
 		Answers:   in.Answers,
 	}
-	if err := manager.MarkPendingAskUserAnswered(ctx, sessionKey, answer.ToolUseID, answer.Answers, time.Now()); err != nil {
-		return err
-	}
+	// Deliver first: a failed delivery must not leave the pending tool call
+	// marked as answered, otherwise the question can never be retried.
 	if err := sess.AnswerQuestion(ctx, answer); err != nil {
 		return err
 	}
+	if err := manager.MarkPendingAskUserAnswered(ctx, sessionKey, answer.ToolUseID, answer.Answers, time.Now()); err != nil {
+		log.Printf("[session.answer_question] mark.error root=%s session=%s tool=%s err=%v", strings.TrimSpace(in.RootID), sessionKey, answer.ToolUseID, err)
+	}
 	return nil
+}
+
+// resolveAnswerRuntimeSession returns the live agent runtime that owns a
+// question. Synthetic Claude subagent sessions only exist as child records in
+// the session manager; their question waiters live on the parent runtime, so
+// walk up the parent chain until a pooled runtime is found.
+func resolveAnswerRuntimeSession(ctx context.Context, manager *session.Manager, sessionKey, agentName string, pool *agent.Pool) (agenttypes.Session, error) {
+	key := strings.TrimSpace(sessionKey)
+	for depth := 0; key != "" && depth < 16; depth++ {
+		if sess, ok := pool.Get(agentPoolSessionKey(key, agentName)); ok {
+			return sess, nil
+		}
+		current, err := manager.Get(ctx, key, 0)
+		if err != nil {
+			return nil, err
+		}
+		key = strings.TrimSpace(current.ParentSessionKey)
+	}
+	return nil, errors.New("agent session not found")
 }
 
 func currentAssistantLine(responseText string) int {
@@ -3622,62 +3907,136 @@ func hydratePendingToolCallAux(ctx context.Context, manager *session.Manager, se
 	return aux
 }
 
+// Tool calls are streamed as a start event plus one or more completion
+// updates, so the buffer holds several entries for the same call. Collapse
+// them into the latest state, but keep the slot of the *first* event: thoughts
+// are flushed when a tool event arrives, so anchoring a card at its completion
+// moved it below the thinking it had produced (and parallel calls came back in
+// completion order after a reload even though the live transcript shows each
+// card where it was invoked). Todo, plan and compact entries are pure state
+// updates; they keep their last slot so the newest state stays at the end.
 func dedupeExchangeAuxBuffer(items []session.ExchangeAux) []session.ExchangeAux {
 	if len(items) == 0 {
 		return nil
 	}
-	seenToolCallIDs := make(map[string]int, len(items))
-	seenPlanIDs := make(map[string]struct{}, len(items))
-	seenCompactIDs := make(map[string]struct{}, len(items))
-	seenTodo := false
-	out := make([]session.ExchangeAux, 0, len(items))
-	for i := len(items) - 1; i >= 0; i-- {
-		item := items[i]
-		callID := ""
+	latestToolCalls := make(map[string]agenttypes.ToolCall, len(items))
+	firstToolCallIndex := make(map[string]int, len(items))
+	lastTodoIndex := -1
+	lastTasksIndex := -1
+	lastPlanIndex := make(map[string]int, len(items))
+	lastCompactIndex := make(map[string]int, len(items))
+	for index, item := range items {
 		if item.ToolCall != nil {
-			callID = strings.TrimSpace(item.ToolCall.CallID)
-		}
-		if callID != "" {
-			if existingIndex, exists := seenToolCallIDs[callID]; exists {
-				if out[existingIndex].ToolCall != nil {
-					merged := mergeBufferedToolCall(*item.ToolCall, *out[existingIndex].ToolCall)
-					out[existingIndex].ToolCall = &merged
+			callID := strings.TrimSpace(item.ToolCall.CallID)
+			if callID != "" {
+				latest := *item.ToolCall
+				if existing, ok := latestToolCalls[callID]; ok {
+					latest = mergeBufferedToolCall(existing, latest)
 				}
-				continue
+				latestToolCalls[callID] = latest
+				if _, ok := firstToolCallIndex[callID]; !ok {
+					firstToolCallIndex[callID] = index
+				}
 			}
-			seenToolCallIDs[callID] = len(out)
 		}
-		isTodo := item.Todo != nil || (item.ToolCall != nil && item.ToolCall.Kind == agenttypes.ToolKindTodo)
-		if isTodo {
-			if seenTodo {
-				continue
-			}
-			seenTodo = true
+		if item.Todo != nil || (item.ToolCall != nil && item.ToolCall.Kind == agenttypes.ToolKindTodo) {
+			lastTodoIndex = index
+		}
+		if item.Tasks != nil {
+			lastTasksIndex = index
 		}
 		if item.Plan != nil {
-			planID := strings.TrimSpace(item.Plan.ID)
-			if planID != "" {
-				if _, exists := seenPlanIDs[planID]; exists {
-					continue
-				}
-				seenPlanIDs[planID] = struct{}{}
+			if planID := strings.TrimSpace(item.Plan.ID); planID != "" {
+				lastPlanIndex[planID] = index
 			}
 		}
 		if item.Compact != nil {
-			compactID := strings.TrimSpace(item.Compact.ID)
-			if compactID != "" {
-				if _, exists := seenCompactIDs[compactID]; exists {
+			if compactID := strings.TrimSpace(item.Compact.ID); compactID != "" {
+				lastCompactIndex[compactID] = index
+			}
+		}
+	}
+	out := make([]session.ExchangeAux, 0, len(items))
+	for index, item := range items {
+		if item.ToolCall != nil {
+			callID := strings.TrimSpace(item.ToolCall.CallID)
+			isTodo := item.ToolCall.Kind == agenttypes.ToolKindTodo
+			if callID != "" && !isTodo {
+				if firstToolCallIndex[callID] != index {
 					continue
 				}
-				seenCompactIDs[compactID] = struct{}{}
+				latest := latestToolCalls[callID]
+				item.ToolCall = &latest
+			}
+			if callID != "" && isTodo && index == lastTodoIndex {
+				latest := latestToolCalls[callID]
+				item.ToolCall = &latest
+			}
+		}
+		if (item.Todo != nil || (item.ToolCall != nil && item.ToolCall.Kind == agenttypes.ToolKindTodo)) && index != lastTodoIndex {
+			continue
+		}
+		if item.Tasks != nil && index != lastTasksIndex {
+			continue
+		}
+		if item.Plan != nil {
+			if planID := strings.TrimSpace(item.Plan.ID); planID != "" && lastPlanIndex[planID] != index {
+				continue
+			}
+		}
+		if item.Compact != nil {
+			if compactID := strings.TrimSpace(item.Compact.ID); compactID != "" && lastCompactIndex[compactID] != index {
+				continue
 			}
 		}
 		out = append(out, item)
 	}
-	for left, right := 0, len(out)-1; left < right; left, right = left+1, right-1 {
-		out[left], out[right] = out[right], out[left]
-	}
 	return out
+}
+
+// isThoughtBoundary reports whether an update starts or ends a visible
+// transcript item, which is where a thought group must be split. Progress
+// heartbeats and repeated state snapshots are not visible boundaries; flushing
+// on them splits a single thinking stream into many blocks.
+func isThoughtBoundary(update agenttypes.Event, seenToolCalls map[string]bool) bool {
+	switch update.Type {
+	case agenttypes.EventTypeMessageChunk, agenttypes.EventTypeMessageDone:
+		return true
+	case agenttypes.EventTypeToolCall:
+		if toolCall, ok := update.Data.(agenttypes.ToolCall); ok {
+			if callID := strings.TrimSpace(toolCall.CallID); callID != "" {
+				seenToolCalls[callID] = true
+			}
+		}
+		return true
+	case agenttypes.EventTypeToolUpdate:
+		toolCall, ok := update.Data.(agenttypes.ToolCall)
+		if !ok {
+			return true
+		}
+		if !shouldPersistToolCallAux(toolCall) {
+			// Heartbeats such as claude_task/task_progress never render a
+			// card, so they must not split the thinking stream.
+			return false
+		}
+		callID := strings.TrimSpace(toolCall.CallID)
+		firstUpdate := callID != "" && !seenToolCalls[callID]
+		if callID != "" {
+			seenToolCalls[callID] = true
+		}
+		return firstUpdate || isTerminalToolStatus(toolCall.Status)
+	default:
+		return false
+	}
+}
+
+func isTerminalToolStatus(status string) bool {
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case "", "running", "pending", "in_progress":
+		return false
+	default:
+		return true
+	}
 }
 
 func shouldPersistToolCallAux(toolCall agenttypes.ToolCall) bool {
@@ -3731,6 +4090,7 @@ func appendResponseChunk(responseText, lastResponseUpdateType, chunk string) str
 			lastResponseUpdateType == string(agenttypes.EventTypeToolCall) ||
 			lastResponseUpdateType == string(agenttypes.EventTypeToolUpdate) ||
 			lastResponseUpdateType == string(agenttypes.EventTypeTodoUpdate) ||
+			lastResponseUpdateType == string(agenttypes.EventTypeTaskUpdate) ||
 			lastResponseUpdateType == string(agenttypes.EventTypePlanUpdate) ||
 			lastResponseUpdateType == string(agenttypes.EventTypeCompact)) &&
 		!strings.HasSuffix(responseText, "\n\n") &&

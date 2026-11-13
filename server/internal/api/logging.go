@@ -76,7 +76,8 @@ func CORSMiddleware(next http.Handler) http.Handler {
 		w.Header().Set("Access-Control-Allow-Origin", origin)
 		w.Header().Set("Access-Control-Allow-Credentials", "true")
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS, PATCH")
-		w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type, X-Requested-With")
+		w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type, X-Requested-With, X-MindFS-E2EE, X-MindFS-Client-ID, X-MindFS-Proof, X-MindFS-TS, X-MindFS-Nonce, X-MindFS-E2EE-Stream")
+		w.Header().Set("Access-Control-Expose-Headers", "X-MindFS-E2EE, X-MindFS-E2EE-Stream, X-MindFS-E2EE-Meta, Content-Length, Content-Disposition")
 		// Private Network Access header: allows WebView (secure context) to reach local network resources
 		w.Header().Set("Access-Control-Allow-Private-Network", "true")
 
