@@ -1286,6 +1286,74 @@ Object.assign(window, { runMomentumTailChecks: async () => {
   return { passed: true, restingGap, finalGap: gap() };
 }});
 
+// Re-arming following is a state change, not a scroll. On a virtualized
+// transcript the reader's downward return mounts rows and corrects heights,
+// and those range changes used to pin the hard bottom immediately — the
+// viewport jumped out from under the gesture. The return must keep the
+// position the reader stopped at; the next real content update still follows.
+Object.assign(window, { runTailArmSilentChecks: async () => {
+  const settle = (ms = 250) => new Promise((resolve) => setTimeout(resolve, ms));
+  const assert = (condition: boolean, message: string) => { if (!condition) throw new Error(message); };
+  const stamp = '2026-11-14T00:00:00Z';
+  const line = '这是一段用于测试静默恢复跟随的中文内容，带 English words 和标点。';
+  const history: any[] = [];
+  for (let i = 0; i < 60; i += 1) {
+    history.push({ seq: i * 2 + 1, role: 'user', content: `问题 ${i}\n${line.repeat(2)}`, timestamp: stamp });
+    history.push({ seq: i * 2 + 2, role: 'agent', content: `回答 ${i}\n\n${line.repeat(5)}`, timestamp: stamp });
+  }
+  let content = line.repeat(6);
+  const render = () => (window as any).check.replaceSession({
+    key: 'tail-arm-silent',
+    exchanges: [
+      ...history,
+      { seq: 121, role: 'user', content: '请继续', timestamp: stamp },
+      { role: 'agent', content, timestamp: stamp },
+    ],
+    exchange_aux: {},
+  });
+  render();
+  await settle(700);
+  const el = [...document.querySelectorAll('div')].find((node) => getComputedStyle(node).overflowY === 'auto') as HTMLElement;
+  const gap = () => Math.round(el.scrollHeight - el.clientHeight - el.scrollTop);
+  const jumpButton = () => document.querySelector('[data-mindfs-jump-latest="1"]') as HTMLElement | null;
+  const endMarker = () => document.querySelector('[data-session-scroll-end="1"]') as HTMLElement;
+  assert(!!el.querySelector('[data-index]'), 'fixture should be virtualized');
+  el.scrollTop = el.scrollHeight;
+  await settle(300);
+  el.scrollTop = el.scrollHeight;
+  await settle(300);
+  assert(gap() < 2, 'fixture should start at the tail');
+
+  // Read older messages.
+  el.dispatchEvent(new WheelEvent('wheel', { bubbles: true, deltaY: -100 }));
+  el.scrollTop = Math.max(0, el.scrollTop - 1200);
+  await settle(350);
+  assert(!!jumpButton(), 'jump button should appear after scrolling up');
+
+  // Return down so the content end is visible while the hard bottom is not.
+  const end = endMarker();
+  assert(!!end, 'missing content end marker');
+  const visibleTailTop =
+    el.scrollTop +
+    (end!.getBoundingClientRect().top - el.getBoundingClientRect().bottom);
+  el.dispatchEvent(new WheelEvent('wheel', { bubbles: true, deltaY: 100 }));
+  el.scrollTop = visibleTailTop + 16;
+  await settle(300);
+  assert(!jumpButton(), 'a downward return must re-arm following');
+  const returnedGap = gap();
+  assert(
+    returnedGap > 40,
+    `re-arming following jumped to the tail (${returnedGap}px below)`,
+  );
+
+  // The next chunk still follows.
+  content += '\n\n' + line.repeat(4);
+  render();
+  await settle(300);
+  assert(gap() < 2, `streamed output was not followed after the return (${gap()}px)`);
+  return { passed: true, returnedGap, finalGap: gap() };
+}});
+
 // Editing a user message restarts the conversation from that point and
 // streams a fresh reply. Unlike a normal send there is no optimistic
 // pending_ack row to re-arm following, so the edit taps or the scroll used to

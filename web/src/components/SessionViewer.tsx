@@ -1568,6 +1568,13 @@ const SESSION_TAIL_CONTROLS_OFFSET = 16;
 const SESSION_TAIL_CONTROLS_SIZE = 34;
 const SESSION_TAIL_CONTROLS_BADGE_OVERHANG = 7;
 const SESSION_TAIL_CONTROLS_GAP = 8;
+// How long after the last real transcript scroll the reader still owns the
+// viewport. Tail-following must not write scrollTop during that window unless
+// new content actually arrived: resuming following near the tail arms the next
+// content update instead of yanking the viewport out from under an in-flight
+// gesture (iOS momentum keeps firing scroll events after touchend, and
+// virtualizer measurement changes look like content growth).
+const SESSION_USER_SCROLL_SETTLE_MS = 160;
 
 function SessionViewerInner({
   session,
@@ -1639,6 +1646,13 @@ function SessionViewerInner({
   // Remember the last write so the scroll listener can tell that movement
   // apart from a reading gesture.
   const virtualizerScrollWriteRef = useRef({ at: 0, offset: 0 });
+  // Tail pins write scrollTop themselves; remember the last write so the
+  // scroll listener does not mistake it for a reading gesture.
+  const sessionStickWriteRef = useRef({ at: 0, offset: 0 });
+  // Timestamp of the last scroll movement that came from the reader (wheel,
+  // touch/momentum, scrollbar, keyboard) rather than from a tail pin, a
+  // virtualizer measurement or a reading-anchor correction.
+  const lastUserViewportMovementAtRef = useRef(0);
   const sessionStickSettleTimersRef = useRef<number[]>([]);
   const previousLoadingRef = useRef(loading);
   const sessionKey = session?.key || session?.session_key || null;
@@ -1847,6 +1861,12 @@ function SessionViewerInner({
   const virtualized = timeline.length > 100;
   const virtualizedRef = useRef(virtualized);
   virtualizedRef.current = virtualized;
+  // While a reading gesture or its momentum is still moving the transcript,
+  // layout/measurement updates must not pin the tail. Content that actually
+  // arrives still pins through the timeline effect below.
+  const isViewportHeldByUser = () =>
+    performance.now() - lastUserViewportMovementAtRef.current <
+    SESSION_USER_SCROLL_SETTLE_MS;
   const virtualizer = useVirtualizer({
     count: timeline.length,
     getScrollElement: () => scrollRef.current,
@@ -1913,10 +1933,15 @@ function SessionViewerInner({
     ])).sort((a, b) => a - b),
     onChange: (instance) => {
       if (!shouldStickToBottomRef.current || instance.isScrolling) return;
+      // The range change may be the reader's own scroll (rows mounting as the
+      // tail approaches). Resuming following arms the next content update; it
+      // must not pin here and turn the gesture into a jump.
+      if (isViewportHeldByUser()) return;
       if (viewportStickFrameRef.current !== null) cancelAnimationFrame(viewportStickFrameRef.current);
       viewportStickFrameRef.current = requestAnimationFrame(() => {
         viewportStickFrameRef.current = null;
-        if (shouldStickToBottomRef.current) stickSessionToBottom();
+        if (!shouldStickToBottomRef.current || isViewportHeldByUser()) return;
+        stickSessionToBottom();
       });
     },
   });
@@ -2187,6 +2212,7 @@ function SessionViewerInner({
     }
     const maxTop = Math.max(0, container.scrollHeight - container.clientHeight);
     lastKnownScrollTopRef.current = maxTop;
+    sessionStickWriteRef.current = { at: performance.now(), offset: maxTop };
     container.scrollTo({ top: maxTop, behavior });
   };
 
@@ -2906,6 +2932,13 @@ function SessionViewerInner({
         anchorWrite.at > 0 &&
         performance.now() - anchorWrite.at < 200 &&
         Math.abs(el.scrollTop - anchorWrite.offset) <= 2;
+      // A tail pin is our own write; it must not look like the reader moving
+      // the viewport, or following would suppress its own catch-up.
+      const stickWrite = sessionStickWriteRef.current;
+      const sessionStickAdjusted =
+        stickWrite.at > 0 &&
+        performance.now() - stickWrite.at < 200 &&
+        Math.abs(el.scrollTop - stickWrite.offset) <= 2;
       // iOS momentum keeps scrolling for far longer than the wheel/touch
       // intent window. While those scroll events keep moving down, the
       // return gesture is still in progress: refresh the intent so an
@@ -2918,16 +2951,19 @@ function SessionViewerInner({
         lastDownwardIntentAtRef.current = performance.now();
       }
       // Any movement that is neither a virtualizer height correction, the
-      // completion anchor write, nor a document shrink/clamp came from the
-      // reader (a scrollbar drag emits no wheel/touch event). Stop pinning
-      // the reading anchor.
+      // completion anchor write, a tail pin, nor a document shrink/clamp came
+      // from the reader (a scrollbar drag emits no wheel/touch event). Stop
+      // pinning the reading anchor and remember that the reader owns the
+      // viewport until the gesture and its momentum settle.
       if (
         (movedUp || movedDown) &&
         !contentShrank &&
         !measurementAdjusted &&
-        !anchorAdjusted
+        !anchorAdjusted &&
+        !sessionStickAdjusted
       ) {
         releaseReadingAnchor();
+        lastUserViewportMovementAtRef.current = performance.now();
       }
       // The tail wins over direction: an iOS overscroll bounce reports upward
       // movement while the view is still at (or beyond) the bottom, and the
@@ -3067,13 +3103,14 @@ function SessionViewerInner({
       const distanceFromBottom =
         container.scrollHeight - container.clientHeight - container.scrollTop;
       if (shouldStickToBottomRef.current) {
-        const maxTop = Math.max(
-          0,
-          container.scrollHeight - container.clientHeight,
-        );
-        lastKnownScrollTopRef.current = maxTop;
-        container.scrollTo({ top: maxTop, behavior: "auto" });
         setShowJumpToLatest((prev) => (prev ? false : prev));
+        // A gesture/momentum still owns the viewport. The growth is not
+        // stranded: following is already armed, so the next chunk or size
+        // change after the reader stops pins the tail.
+        if (isViewportHeldByUser()) {
+          return;
+        }
+        stickSessionToBottom("auto");
         return;
       }
       // A layout shrink can bring the reader back to the tail without a
@@ -3129,7 +3166,10 @@ function SessionViewerInner({
       }
       frame = window.requestAnimationFrame(() => {
         frame = null;
-        if (shouldStickToBottomRef.current) {
+        if (
+          shouldStickToBottomRef.current &&
+          !isViewportHeldByUser()
+        ) {
           stickSessionToBottom("auto");
         }
       });

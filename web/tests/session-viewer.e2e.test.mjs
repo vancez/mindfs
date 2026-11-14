@@ -43,6 +43,14 @@ registerSessionViewerChecks([
     run: "runMomentumTailChecks",
     label: "a fling back to the newest message resumes following",
   },
+  // Re-arming following is a state change, not a scroll. On a virtualized
+  // transcript the return gesture mounts rows and corrects heights; those
+  // range changes must not pin the hard bottom by themselves, or the viewport
+  // jumps out from under the gesture. The next chunk still follows.
+  {
+    run: "runTailArmSilentChecks",
+    label: "a downward return to the tail re-arms without jumping",
+  },
   // Editing a message regenerates the conversation from that point. There is
   // no optimistic pending_ack row to re-arm following, so submitting the
   // inline editor must return the viewport to the tail itself.
