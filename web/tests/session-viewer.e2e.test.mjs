@@ -149,6 +149,28 @@ registerSessionViewerChecks([
       );
     },
   },
+  // Completion hardening: ensure the anchor resolves tools by callId across
+  // the live -> persisted re-key, ignores layout-induced scroll events during
+  // the rebuild, and stays armed for a re-sync that lands after the old 2s
+  // settle window.
+  {
+    run: "runCompletionAnchorHardeningChecks",
+    label: "completion keeps the anchor through re-keys, rebuild scrolls and late syncs",
+    verify: (result) => {
+      assert.ok(
+        Math.abs(result.toolShift) < 8,
+        `completion pinned a different row after the tool re-key (${result.toolShift}px)`,
+      );
+      assert.ok(
+        Math.abs(result.rebuildNudgeShift) < 8,
+        `a rebuild scroll released the completion hold (${result.rebuildNudgeShift}px)`,
+      );
+      assert.ok(
+        Math.abs(result.lateSyncShift) < 8,
+        `a late completion sync moved the reading anchor (${result.lateSyncShift}px)`,
+      );
+    },
+  },
 
   // --- Tail layout ----------------------------------------------------------
   // The floating user-message-summary control must stay below the last

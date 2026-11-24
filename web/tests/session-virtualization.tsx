@@ -1072,6 +1072,151 @@ Object.assign(window, { runCompletionThoughtAnchorChecks: async () => {
   };
 }});
 
+// Completion hardening: the anchor must survive the parts of the re-sync that
+// the basic fixture does not model.
+//  - Tools move from a transient role:"tool" exchange into the agent's aux
+//    list, so their exchange-scoped timeline id and index change. The callId
+//    is the only stable identity; resolving by the old index pins a different
+//    row and moves the reader.
+//  - Rebuilding the row set makes the browser/scroller adjust scrollTop. Those
+//    scroll events are layout corrections, not reading gestures; releasing the
+//    hold on them leaves the transcript unguarded exactly when it settles.
+//  - A big session's completion re-sync can land after the old 2s window.
+//    The hold has to stay armed across it (bounded by the completion cap).
+Object.assign(window, { runCompletionAnchorHardeningChecks: async () => {
+  const settle = (ms = 250) => new Promise((resolve) => setTimeout(resolve, ms));
+  const assert = (condition: boolean, message: string) => { if (!condition) throw new Error(message); };
+  const stamp = '2026-11-13T00:00:00Z';
+  const filler = '这是一段用于撑高历史记录的回复内容。\n'.repeat(10);
+  const scroller = () => [...document.querySelectorAll('div')]
+    .find((node) => getComputedStyle(node).overflowY === 'auto') as HTMLElement;
+  const toolTitle = 'ANCHOR TOOL TARGET';
+  const toolRow = (root: HTMLElement) =>
+    [...root.querySelectorAll<HTMLElement>('[data-timeline-index]')]
+      .find((node) => (node.innerText || '').includes(toolTitle));
+  const topOffset = (row: HTMLElement, el: HTMLElement) =>
+    row.getBoundingClientRect().top - el.getBoundingClientRect().top;
+
+  const history: any[] = [];
+  for (let i = 0; i < 12; i += 1) {
+    history.push({ seq: i * 2 + 1, role: 'user', content: `历史问题 ${i}`, timestamp: stamp });
+    history.push({ seq: i * 2 + 2, role: 'agent', content: `历史回答 ${i}\n\n${filler}`, timestamp: stamp });
+  }
+  const toolCall = {
+    callId: 'anchor-tool',
+    kind: 'read',
+    status: 'complete',
+    title: toolTitle,
+    meta: { filePath: 'anchor.ts', input: '{}' },
+    content: [{ type: 'text', text: 'anchor tool detail\n'.repeat(8) }],
+    locations: [{ path: 'anchor.ts' }],
+  };
+  const latestUser = { seq: 25, role: 'user', content: '继续', timestamp: stamp };
+  const optimistic = { role: 'user', content: '继续', timestamp: stamp };
+  const narration = { role: 'agent', content: `中间说明\n\n${filler}`, timestamp: stamp };
+  // Tall enough that the anchor tool can sit at the top of the viewport with
+  // the final answer still below it.
+  const finalText = `最终回复\n\n${filler.repeat(6)}`;
+  const live = (key: string, extra: any[] = []) => ({
+    key,
+    pending: true,
+    exchanges: [
+      ...history, ...extra, optimistic, latestUser,
+      { role: 'tool', content: '', timestamp: stamp, toolCall },
+      { role: 'agent', content: finalText, timestamp: stamp },
+    ],
+    exchange_aux: {},
+  });
+  const completed = (key: string, extra: any[] = []) => ({
+    key,
+    pending: false,
+    exchanges: [
+      ...history, ...extra, latestUser,
+      { seq: 26, role: 'agent', content: finalText, timestamp: stamp },
+    ],
+    exchange_aux: { '26': [{ seq: 26, line: 0, toolcall: toolCall }] },
+  });
+
+  const armOnTool = async (fixture: any) => {
+    (window as any).check.replaceSession(fixture);
+    await settle(700);
+    const el = scroller();
+    const elRect = el.getBoundingClientRect();
+    const row = toolRow(el);
+    assert(!!row, `${fixture.key}: missing anchor tool row`);
+    el.dispatchEvent(new WheelEvent('wheel', { bubbles: true, deltaY: -5 }));
+    el.scrollTop += row!.getBoundingClientRect().top - elRect.top;
+    await settle(400);
+    const anchored = toolRow(el);
+    assert(!!anchored, `${fixture.key}: anchor tool row disappeared`);
+    return { el, before: topOffset(anchored!, el), scrollTop: el.scrollTop };
+  };
+
+  // (1) callId beats the exchange-scoped index: completion removes the
+  // optimistic user copy above the tool, so its index shifts by one.
+  const keyA = 'completion-hardening-tool';
+  const a = await armOnTool(live(keyA));
+  (window as any).check.replaceSession(completed(keyA));
+  await settle(900);
+  const aRow = toolRow(a.el);
+  assert(!!aRow, 'anchor tool row disappeared after completion');
+  const aAfter = topOffset(aRow!, a.el);
+  const toolShift = aAfter - a.before;
+  assert(
+    Math.abs(toolShift) < 8,
+    `completion anchored the wrong row (tool moved ${Math.round(toolShift)}px, before ${Math.round(a.before)} after ${Math.round(aAfter)} scrollTop ${Math.round(a.scrollTop)} -> ${Math.round(a.el.scrollTop)}, index ${aRow!.dataset.timelineIndex})`,
+  );
+
+  // (2) A bare scroll during the rebuild window (the browser correcting
+  // scrollTop, a scrollbar drag has no wheel/touch event) must not release the
+  // hold. The anchor pulls the row back on the next frame.
+  const keyB = 'completion-hardening-rebuild';
+  const b = await armOnTool(live(keyB));
+  (window as any).check.replaceSession(completed(keyB));
+  await settle(150);
+  const bRowBefore = toolRow(b.el);
+  assert(!!bRowBefore, 'anchor tool row disappeared after completion');
+  const bBefore = topOffset(bRowBefore!, b.el);
+  const beforeNudge = Math.round(b.el.scrollTop);
+  b.el.scrollTop = Math.max(0, b.el.scrollTop - 40);
+  await settle(300);
+  const bRow = toolRow(b.el);
+  assert(!!bRow, 'anchor tool row disappeared after a rebuild scroll');
+  const nudgeShift = topOffset(bRow!, b.el) - bBefore;
+  assert(
+    Math.abs(nudgeShift) < 8,
+    `a rebuild scroll released the hold (tool at ${Math.round(nudgeShift)}px, scrollTop ${beforeNudge} -> ${Math.round(b.el.scrollTop)})`,
+  );
+
+  // (3) The re-sync lands after the old 2s settle window. Removing a tall
+  // transient narration row above the tool moves it; the hold must stay armed
+  // and pull it back.
+  const keyC = 'completion-hardening-late';
+  const c = await armOnTool(live(keyC, [narration]));
+  (window as any).check.replaceSession(completed(keyC, [narration]));
+  await settle(500);
+  const cRowBefore = toolRow(c.el);
+  assert(!!cRowBefore, 'anchor tool row disappeared after the first sync');
+  const cBefore = topOffset(cRowBefore!, c.el);
+  await settle(2200);
+  (window as any).check.replaceSession(completed(keyC));
+  await settle(700);
+  const cRow = toolRow(c.el);
+  assert(!!cRow, 'anchor tool row disappeared after the late sync');
+  const lateShift = topOffset(cRow!, c.el) - cBefore;
+  assert(
+    Math.abs(lateShift) < 8,
+    `a late completion sync moved the anchor (tool moved ${Math.round(lateShift)}px)`,
+  );
+
+  return {
+    passed: true,
+    toolShift: Math.round(toolShift),
+    rebuildNudgeShift: Math.round(nudgeShift),
+    lateSyncShift: Math.round(lateShift),
+  };
+}});
+
 // The transcript reserves tall tail space below the last row for the floating
 // jump/task controls, so a reader can stop with the newest message fully
 // visible while the scrollable bottom is still ~65-85px further down. Treating

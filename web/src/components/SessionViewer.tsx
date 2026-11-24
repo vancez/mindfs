@@ -1575,6 +1575,34 @@ const SESSION_TAIL_CONTROLS_GAP = 8;
 // gesture (iOS momentum keeps firing scroll events after touchend, and
 // virtualizer measurement changes look like content growth).
 const SESSION_USER_SCROLL_SETTLE_MS = 160;
+// A completion re-sync can land well after the stream flag flips (network,
+// E2EE, large sessions) and the re-keyed rows keep settling after it. Keep the
+// completion reading anchor available across that window, bounded so a stale
+// hold can never fight the reader forever. Real wheel/touch/key input releases
+// it immediately; bare scroll events are ignored while a rebuild is being laid
+// out (see SESSION_COMPLETION_REBUILD_GRACE_MS).
+const SESSION_COMPLETION_HOLD_MAX_MS = 12000;
+// After the last post-completion timeline rebuild, hold for this long so the
+// re-keyed rows and late markdown/code layout finish under the anchor.
+const SESSION_COMPLETION_HOLD_SETTLE_MS = 2000;
+// Scroll events that arrive while a completion rebuild is being laid out are
+// the browser/scroller correcting itself, not a reading gesture. The hold
+// ignores them for this long after the rebuild and after it is first armed.
+const SESSION_COMPLETION_REBUILD_GRACE_MS = 400;
+
+type ReadingAnchor = {
+  itemId: string;
+  // Stable identities. Timeline ids include the live exchange index, so tools
+  // and thoughts are often re-keyed when the turn is persisted; the callId /
+  // thoughtId still identify the same row.
+  toolCallId: string;
+  thoughtId: string;
+  contentHint: string;
+  type: string;
+  index: number;
+  offset: number;
+  sessionKey: string;
+};
 
 function SessionViewerInner({
   session,
@@ -1765,31 +1793,26 @@ function SessionViewerInner({
   // folded into exchange_aux) can disappear or be re-keyed in one commit, and
   // the virtualizer does not compensate for rows removed above the viewport:
   // the text under the reader jumps. Pin the top visible row's screen offset
-  // for a short settle window instead.
+  // across the completion re-sync and the layout settling that follows.
   const previousStreamingRef = useRef(isStreaming);
   const previousAwaitingRef = useRef(isAwaiting);
   const previousCompletionSessionRef = useRef(sessionKey);
   // The completion update can render in the same commit that flips the
   // stream flag, so the post-commit effect is already too late to see the
   // pre-update layout. Track the reader's top row on every paused scroll.
-  const liveReadingAnchorRef = useRef<{
-    itemId: string;
-    contentHint: string;
-    type: string;
-    index: number;
-    offset: number;
-    sessionKey: string;
-  } | null>(null);
-  const readingAnchorRef = useRef<{
-    itemId: string;
-    contentHint: string;
-    type: string;
-    index: number;
-    offset: number;
-    sessionKey: string;
-  } | null>(null);
+  const liveReadingAnchorRef = useRef<ReadingAnchor | null>(null);
+  const readingAnchorRef = useRef<ReadingAnchor | null>(null);
   const readingAnchorFrameRef = useRef<number | null>(null);
   const readingAnchorDeadlineRef = useRef(0);
+  // Hard cap for the current completion hold and the timeline it started from.
+  // Each later rebuild shortens the deadline to a settle window (bounded by
+  // the cap) instead of leaving the scroll unlocked.
+  const completionHoldCapRef = useRef(0);
+  const completionHeldTimelineRef = useRef<TimelineItem[] | null>(null);
+  const readingAnchorArmedAtRef = useRef(0);
+  // Last timeline rebuild. Scroll events right after one are layout
+  // corrections, not a reading gesture.
+  const timelineRebuildAtRef = useRef(0);
   const readingAnchorWriteRef = useRef({ at: 0, offset: 0 });
   const timelineRef = useRef(timeline);
   timelineRef.current = timeline;
@@ -1983,6 +2006,8 @@ function SessionViewerInner({
     }
     return {
       itemId: item.id || "",
+      toolCallId: item.type === "tool" ? item.toolCall?.callId || "" : "",
+      thoughtId: item.type === "thought" ? item.thoughtId || "" : "",
       contentHint: "content" in item ? (item.content || "").slice(0, 80) : "",
       type: item.type,
       index,
@@ -1993,6 +2018,9 @@ function SessionViewerInner({
 
   const releaseReadingAnchor = useCallback(() => {
     readingAnchorRef.current = null;
+    completionHoldCapRef.current = 0;
+    completionHeldTimelineRef.current = null;
+    readingAnchorArmedAtRef.current = 0;
     if (readingAnchorFrameRef.current !== null) {
       window.cancelAnimationFrame(readingAnchorFrameRef.current);
       readingAnchorFrameRef.current = null;
@@ -2019,11 +2047,14 @@ function SessionViewerInner({
     }
     const items = timelineRef.current;
     // The completion re-sync re-keys rows (timeline ids are exchange-scoped)
-    // and drops transient rows, so the recorded id is often gone. Resolve the
-    // same content occurrence by the match *nearest* the recorded index:
-    // short user messages like "继续" repeat across a session, and the first
-    // content match can sit thousands of pixels above the reader. Pinning it
-    // yanked the viewport back to an earlier conversation.
+    // and drops transient rows, so resolve by stable identity first. The
+    // callId / thoughtId survive the move from the live exchange list into the
+    // agent's aux list; the exchange index inside the timeline id does not.
+    // Content matches are the last resort, still resolved by the occurrence
+    // *nearest* the recorded index: short messages like "继续" repeat across a
+    // session, and the first content match can sit thousands of pixels above
+    // the reader. Pinning it yanked the viewport back to an earlier
+    // conversation.
     const nearestToAnchor = (candidates: number[]) =>
       candidates.reduce((best, candidate) =>
         Math.abs(candidate - anchor.index) < Math.abs(best - anchor.index)
@@ -2031,7 +2062,32 @@ function SessionViewerInner({
           : best,
       );
     let index = -1;
-    if (anchor.itemId) {
+    if (anchor.toolCallId) {
+      const matches: number[] = [];
+      items.forEach((item, itemIndex) => {
+        if (
+          item.type === "tool" &&
+          (item.toolCall?.callId || "") === anchor.toolCallId
+        ) {
+          matches.push(itemIndex);
+        }
+      });
+      if (matches.length > 0) {
+        index = nearestToAnchor(matches);
+      }
+    }
+    if (index < 0 && anchor.thoughtId) {
+      const matches: number[] = [];
+      items.forEach((item, itemIndex) => {
+        if (item.type === "thought" && item.thoughtId === anchor.thoughtId) {
+          matches.push(itemIndex);
+        }
+      });
+      if (matches.length > 0) {
+        index = nearestToAnchor(matches);
+      }
+    }
+    if (index < 0 && anchor.itemId) {
       const matches: number[] = [];
       items.forEach((item, itemIndex) => {
         if ((item.id || "") === anchor.itemId) {
@@ -2094,7 +2150,7 @@ function SessionViewerInner({
       readingAnchorFrameRef.current =
         window.requestAnimationFrame(holdReadingAnchor);
     } else {
-      readingAnchorRef.current = null;
+      releaseReadingAnchor();
     }
   }, [releaseReadingAnchor, virtualizer]);
 
@@ -2627,6 +2683,12 @@ function SessionViewerInner({
     resumeFollowing,
   ]);
 
+  // Stamp each timeline rebuild so the scroll handler can tell a layout
+  // correction from a reading gesture while a completion anchor is held.
+  useLayoutEffect(() => {
+    timelineRebuildAtRef.current = performance.now();
+  }, [timeline]);
+
   // A turn finishes in two steps: the stream flag flips, then the App
   // re-syncs the persisted exchanges (which can remove or re-key rows above
   // the reader). Capture the row at the top of the viewport while the layout
@@ -2642,6 +2704,26 @@ function SessionViewerInner({
     const completed =
       !sessionChanged &&
       ((wasStreaming && !isStreaming) || (wasAwaiting && !isAwaiting));
+    const now = performance.now();
+    // The re-sync and the late layout it triggers keep changing the timeline.
+    // Once the anchor is armed, every rebuild re-arms a short settle window
+    // (bounded by the completion cap) so a re-sync that lands after the
+    // initial window is still covered.
+    if (
+      !sessionChanged &&
+      readingAnchorRef.current &&
+      now < readingAnchorDeadlineRef.current &&
+      completionHeldTimelineRef.current !== timeline
+    ) {
+      completionHeldTimelineRef.current = timeline;
+      readingAnchorDeadlineRef.current = Math.min(
+        completionHoldCapRef.current,
+        now + SESSION_COMPLETION_HOLD_SETTLE_MS,
+      );
+      if (readingAnchorFrameRef.current === null) {
+        holdReadingAnchor();
+      }
+    }
     if (!completed) {
       if (sessionChanged) {
         liveReadingAnchorRef.current = null;
@@ -2668,7 +2750,10 @@ function SessionViewerInner({
       return;
     }
     readingAnchorRef.current = anchor;
-    readingAnchorDeadlineRef.current = performance.now() + 2000;
+    readingAnchorArmedAtRef.current = now;
+    completionHoldCapRef.current = now + SESSION_COMPLETION_HOLD_MAX_MS;
+    completionHeldTimelineRef.current = timeline;
+    readingAnchorDeadlineRef.current = completionHoldCapRef.current;
     if (readingAnchorFrameRef.current === null) {
       // Re-resolve now, before this commit paints: the completion update can
       // already have moved the rows above the reader in this commit, and on
@@ -2950,6 +3035,16 @@ function SessionViewerInner({
       ) {
         lastDownwardIntentAtRef.current = performance.now();
       }
+      // The completion re-sync replaces the whole row set, and the browser /
+      // scroller corrects scrollTop while the new layout settles. Those scroll
+      // events are not reading gestures; real wheel/touch/key input releases
+      // the anchor through its own handler. Without this grace a bare
+      // correction released the hold exactly when the transcript needed it.
+      const now = performance.now();
+      const completionRebuildGrace =
+        readingAnchorRef.current !== null &&
+        (now - timelineRebuildAtRef.current < SESSION_COMPLETION_REBUILD_GRACE_MS ||
+          now - readingAnchorArmedAtRef.current < SESSION_COMPLETION_REBUILD_GRACE_MS);
       // Any movement that is neither a virtualizer height correction, the
       // completion anchor write, a tail pin, nor a document shrink/clamp came
       // from the reader (a scrollbar drag emits no wheel/touch event). Stop
@@ -2960,10 +3055,11 @@ function SessionViewerInner({
         !contentShrank &&
         !measurementAdjusted &&
         !anchorAdjusted &&
-        !sessionStickAdjusted
+        !sessionStickAdjusted &&
+        !completionRebuildGrace
       ) {
         releaseReadingAnchor();
-        lastUserViewportMovementAtRef.current = performance.now();
+        lastUserViewportMovementAtRef.current = now;
       }
       // The tail wins over direction: an iOS overscroll bounce reports upward
       // movement while the view is still at (or beyond) the bottom, and the
