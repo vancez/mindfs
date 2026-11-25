@@ -12697,11 +12697,24 @@ export function App({ onGoHome }: AppProps) {
     gitHistoryLoading || (gitHistoryAvailable && (gitHistory?.items.length || 0) > 0);
   const activePendingPluginTrust =
     pendingPluginTrust && pendingPluginTrust.rootId === currentRootId ? pendingPluginTrust : null;
+  // Opening a file or a diff clears the main session selection. The related
+  // list must keep following the session the user just left instead of
+  // rebinding to the drawer/bound session (usually the newest one), otherwise
+  // clicking a related file silently switches the sidebar to another session.
+  // An open drawer still wins because it is then the active session surface,
+  // and a last-main snapshot from another project must not leak across roots.
+  const lastMainSessionRoot =
+    (lastMainSessionSnapshotRef.current?.root_id as string | undefined) || "";
+  const lastMainSessionSnapshotForRoot =
+    !lastMainSessionRoot || !currentRootId || lastMainSessionRoot === currentRootId
+      ? lastMainSessionSnapshotRef.current
+      : null;
   const relatedSessionSnapshot =
     selectedKanbanTaskSessionSnapshot ||
     selectedSessionSnapshot ||
-    drawerSessionSnapshot ||
-    lastMainSessionSnapshotRef.current;
+    (isDrawerOpen ? drawerSessionSnapshot : null) ||
+    lastMainSessionSnapshotForRoot ||
+    drawerSessionSnapshot;
   const relatedSessionRootId =
     (relatedSessionSnapshot?.root_id as string | undefined) ||
     selectedKanbanTask?.root_id ||
@@ -15602,6 +15615,9 @@ export function App({ onGoHome }: AppProps) {
                 selectedSessionRef.current = null;
                 currentSessionRef.current = null;
                 selectedSessionByRootRef.current[root] = null;
+                // A new session starts with no related-file context; don't let
+                // the sidebar keep showing the previous session's files.
+                lastMainSessionSnapshotRef.current = null;
                 setSelectedSession(null);
                 setSelectedSessionLoading(false);
                 // 新建会话 = 回到空白首页：文件预览/diff 也一并退出，否则预览态无法快速返回
