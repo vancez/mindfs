@@ -56,6 +56,7 @@ const (
 	probeInteractionTimeout = 3 * time.Minute
 	probeModelListTimeout   = 30 * time.Second
 	probeCommandListTimeout = 30 * time.Second
+	probeCommandWaitTimeout = 500 * time.Millisecond
 	probeRotateAfterCount   = 100
 	probeRotateAfterAge     = 24 * time.Hour
 	probeSessionStoreFile   = "probe-sessions.json"
@@ -870,6 +871,20 @@ func populateProbeCommands(ctx context.Context, sess agenttypes.Session, status 
 	if err != nil {
 		status.CommandsError = err.Error()
 		return
+	}
+	// ACP agents publish available_commands_update shortly after session/new.
+	// Wait for that first update instead of snapshotting an empty list.
+	if len(commands.Commands) == 0 {
+		if waiter, ok := sess.(agenttypes.CommandWaiter); ok {
+			if waitErr := waiter.WaitCommands(commandsCtx, probeCommandWaitTimeout); waitErr != nil && commandsCtx.Err() == nil {
+				log.Printf("[agent/probe] commands.wait.error agent=%s err=%v", status.Name, waitErr)
+			}
+			commands, err = sess.ListCommands(commandsCtx)
+			if err != nil {
+				status.CommandsError = err.Error()
+				return
+			}
+		}
 	}
 	status.Commands = commands.Commands
 }

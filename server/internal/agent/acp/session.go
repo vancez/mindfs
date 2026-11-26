@@ -372,6 +372,13 @@ func (s *session) ListCommands(_ context.Context) (types.CommandList, error) {
 	return mapCommandState(s.proc.SessionCommands(s.sessionKey)), nil
 }
 
+func (s *session) WaitCommands(ctx context.Context, timeout time.Duration) error {
+	if s == nil || s.proc == nil {
+		return errors.New("acp session not initialized")
+	}
+	return s.proc.WaitCommands(ctx, s.sessionKey, timeout)
+}
+
 func (s *session) CancelCurrentTurn() error {
 	return s.proc.CancelCurrentTurn(s.sessionKey)
 }

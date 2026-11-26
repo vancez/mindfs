@@ -38,16 +38,17 @@ type Process struct {
 	tree      processTree
 	closeMu   sync.Mutex
 
-	mu            sync.RWMutex
-	sessions      map[string]*sessionState // sessionKey -> state
-	sessionsByID  map[string]*sessionState // ACP session id -> state
-	capability    CapabilitySnapshot
-	models        *acp.SessionModelState
-	modes         *acp.SessionModeState
-	configOptions []acp.SessionConfigOption
-	commands      []acp.AvailableCommand
-	stderrHint    stderrHintState
-	activePrompt  activePromptState
+	mu              sync.RWMutex
+	sessions        map[string]*sessionState          // sessionKey -> state
+	sessionsByID    map[string]*sessionState          // ACP session id -> state
+	pendingCommands map[string][]acp.AvailableCommand // session id -> commands received before registration
+	capability      CapabilitySnapshot
+	models          *acp.SessionModelState
+	modes           *acp.SessionModeState
+	configOptions   []acp.SessionConfigOption
+	commands        []acp.AvailableCommand
+	stderrHint      stderrHintState
+	activePrompt    activePromptState
 }
 
 // processTree owns platform resources for one ACP process and its descendants.
@@ -80,12 +81,18 @@ type activePromptState struct {
 
 var stderrMessagePattern = regexp.MustCompile(`"message"\s*:\s*"([^"]+)"`)
 
+// maxPendingCommandSessions bounds sessions whose command list arrived before
+// their session/new response registered them. Commands are snapshots, so only
+// the latest list per session is kept.
+const maxPendingCommandSessions = 32
+
 type sessionState struct {
 	ID                     acp.SessionId
 	models                 *acp.SessionModelState
 	modes                  *acp.SessionModeState
 	configOptions          []acp.SessionConfigOption
 	commands               []acp.AvailableCommand
+	commandsReady          chan struct{}
 	contextWindow          types.ContextWindow
 	contextUsageUpdateSeen bool
 	lastUsage              cumulativeTokenUsage
@@ -159,12 +166,20 @@ func (s *sessionState) getConfigOptions() []acp.SessionConfigOption {
 
 func (s *sessionState) setCommands(commands []acp.AvailableCommand) {
 	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.commandsReady == nil {
+		s.commandsReady = make(chan struct{})
+	}
 	if len(commands) == 0 {
 		s.commands = nil
-	} else {
-		s.commands = append([]acp.AvailableCommand(nil), commands...)
+		return
 	}
-	s.mu.Unlock()
+	s.commands = append([]acp.AvailableCommand(nil), commands...)
+	select {
+	case <-s.commandsReady:
+	default:
+		close(s.commandsReady)
+	}
 }
 
 func (s *sessionState) getCommands() []acp.AvailableCommand {
@@ -174,6 +189,32 @@ func (s *sessionState) getCommands() []acp.AvailableCommand {
 		return nil
 	}
 	return append([]acp.AvailableCommand(nil), s.commands...)
+}
+
+// waitCommands blocks until commands are published or the timeout elapses.
+// A timeout is not an error: many agents never publish slash commands.
+func (s *sessionState) waitCommands(ctx context.Context, timeout time.Duration) error {
+	s.mu.Lock()
+	if len(s.commands) > 0 {
+		s.mu.Unlock()
+		return nil
+	}
+	if s.commandsReady == nil {
+		s.commandsReady = make(chan struct{})
+	}
+	ready := s.commandsReady
+	s.mu.Unlock()
+
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case <-ready:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 func (s *sessionState) setContextWindow(contextWindow types.ContextWindow) {
@@ -303,38 +344,26 @@ func (p *Process) getSessionUpdateHandler(sessionID string) sessionUpdateHandler
 }
 
 func (c *mindfsClient) SessionUpdate(ctx context.Context, params acp.SessionNotification) error {
-	session := c.proc.getSessionByID(string(params.SessionId))
+	sessionID := string(params.SessionId)
+	session := c.proc.getSessionByID(sessionID)
 	if session == nil {
+		// ACP may publish commands before the session/new response reaches us.
+		// Keep the snapshot so the session sees it as soon as it is registered.
+		if params.Update.AvailableCommandsUpdate != nil {
+			c.proc.bufferPendingCommands(sessionID, params.Update.AvailableCommandsUpdate.AvailableCommands)
+		}
 		return nil
 	}
+
+	// Session state must be updated even without a streaming handler; probe
+	// sessions rely on the command list and never register an onUpdate hook.
+	c.proc.applySessionState(session, params.Update)
+
 	handler := session.getOnUpdate()
 	if handler == nil {
 		return nil
 	}
 
-	internalUpdate := wrapSessionUpdate(string(params.SessionId), params.Update)
-	if params.Update.AvailableCommandsUpdate != nil {
-		session.setCommands(params.Update.AvailableCommandsUpdate.AvailableCommands)
-		c.proc.mu.Lock()
-		c.proc.commands = append([]acp.AvailableCommand(nil), params.Update.AvailableCommandsUpdate.AvailableCommands...)
-		c.proc.mu.Unlock()
-	}
-	if params.Update.CurrentModeUpdate != nil {
-		current := params.Update.CurrentModeUpdate.CurrentModeId
-		if state := session.getModes(); state != nil {
-			state.CurrentModeId = current
-			session.setModes(state)
-			c.proc.mu.Lock()
-			c.proc.modes = state
-			c.proc.mu.Unlock()
-		}
-	}
-	if params.Update.ConfigOptionUpdate != nil {
-		session.setConfigOptions(params.Update.ConfigOptionUpdate.ConfigOptions)
-		c.proc.mu.Lock()
-		c.proc.configOptions = cloneConfigOptions(params.Update.ConfigOptionUpdate.ConfigOptions)
-		c.proc.mu.Unlock()
-	}
 	if params.Update.UsageUpdate != nil {
 		if session.setUsageUpdate(
 			params.Update.UsageUpdate.Used,
@@ -342,11 +371,12 @@ func (c *mindfsClient) SessionUpdate(ctx context.Context, params acp.SessionNoti
 		) {
 			handler(SessionUpdate{
 				Type:      UpdateTypeContextUpdate,
-				SessionID: string(params.SessionId),
+				SessionID: sessionID,
 			})
 		}
 	}
 
+	internalUpdate := wrapSessionUpdate(sessionID, params.Update)
 	if internalUpdate.Type != "" {
 		handler(internalUpdate)
 	} else {
@@ -354,6 +384,79 @@ func (c *mindfsClient) SessionUpdate(ctx context.Context, params acp.SessionNoti
 		log.Printf("[agent/acp] unhandled raw=%s", string(raw))
 	}
 	return nil
+}
+
+func (p *Process) applySessionState(session *sessionState, update acp.SessionUpdate) {
+	if p == nil || session == nil {
+		return
+	}
+	if update.AvailableCommandsUpdate != nil {
+		p.applyCommands(session, update.AvailableCommandsUpdate.AvailableCommands)
+	}
+	if update.CurrentModeUpdate != nil {
+		current := update.CurrentModeUpdate.CurrentModeId
+		if state := session.getModes(); state != nil {
+			state.CurrentModeId = current
+			session.setModes(state)
+			p.mu.Lock()
+			p.modes = state
+			p.mu.Unlock()
+		}
+	}
+	if update.ConfigOptionUpdate != nil {
+		options := update.ConfigOptionUpdate.ConfigOptions
+		session.setConfigOptions(options)
+		p.mu.Lock()
+		p.configOptions = cloneConfigOptions(options)
+		p.mu.Unlock()
+	}
+}
+
+func (p *Process) applyCommands(session *sessionState, commands []acp.AvailableCommand) {
+	if p == nil || session == nil {
+		return
+	}
+	session.setCommands(commands)
+	p.mu.Lock()
+	p.commands = append([]acp.AvailableCommand(nil), commands...)
+	p.mu.Unlock()
+}
+
+// bufferPendingCommands stores the latest command snapshot for a session that
+// has not finished registering yet. This closes the ordering gap where an ACP
+// agent publishes available_commands_update before the session/new or
+// session/resume response is processed.
+func (p *Process) bufferPendingCommands(sessionID string, commands []acp.AvailableCommand) {
+	if p == nil || strings.TrimSpace(sessionID) == "" || len(commands) == 0 {
+		return
+	}
+	p.mu.Lock()
+	if session, ok := p.sessionsByID[sessionID]; ok {
+		p.mu.Unlock()
+		p.applyCommands(session, commands)
+		return
+	}
+	if p.pendingCommands == nil {
+		p.pendingCommands = make(map[string][]acp.AvailableCommand)
+	}
+	if _, exists := p.pendingCommands[sessionID]; !exists && len(p.pendingCommands) >= maxPendingCommandSessions {
+		p.mu.Unlock()
+		return
+	}
+	p.pendingCommands[sessionID] = append([]acp.AvailableCommand(nil), commands...)
+	p.mu.Unlock()
+}
+
+func (p *Process) takePendingCommandsLocked(sessionID string) []acp.AvailableCommand {
+	if len(p.pendingCommands) == 0 {
+		return nil
+	}
+	commands := p.pendingCommands[sessionID]
+	if commands == nil {
+		return nil
+	}
+	delete(p.pendingCommands, sessionID)
+	return commands
 }
 
 func (c *mindfsClient) RequestPermission(ctx context.Context, params acp.RequestPermissionRequest) (acp.RequestPermissionResponse, error) {
@@ -534,12 +637,13 @@ func Start(ctx context.Context, agentName, command string, args []string, cwd st
 	}
 
 	proc := &Process{
-		agentName:    agentName,
-		cmd:          cmd,
-		sessions:     make(map[string]*sessionState),
-		sessionsByID: make(map[string]*sessionState),
-		waitCh:       make(chan error, 1),
-		tree:         tree,
+		agentName:       agentName,
+		cmd:             cmd,
+		sessions:        make(map[string]*sessionState),
+		sessionsByID:    make(map[string]*sessionState),
+		pendingCommands: make(map[string][]acp.AvailableCommand),
+		waitCh:          make(chan error, 1),
+		tree:            tree,
 	}
 	proc.client = &mindfsClient{proc: proc}
 	go streamProcessStderr(proc, stderr)
@@ -629,6 +733,10 @@ func (p *Process) NewSession(ctx context.Context, sessionKey, cwd string) error 
 	p.configOptions = cloneConfigOptions(resp.ConfigOptions)
 	p.sessions[sessionKey] = sess
 	p.sessionsByID[string(resp.SessionId)] = sess
+	if pendingCommands := p.takePendingCommandsLocked(string(resp.SessionId)); len(pendingCommands) > 0 {
+		sess.setCommands(pendingCommands)
+		p.commands = append([]acp.AvailableCommand(nil), pendingCommands...)
+	}
 	p.mu.Unlock()
 	return nil
 }
@@ -671,6 +779,10 @@ func (p *Process) ResumeSession(ctx context.Context, sessionKey, sessionID, cwd 
 	p.configOptions = cloneConfigOptions(resp.ConfigOptions)
 	p.sessions[sessionKey] = sess
 	p.sessionsByID[string(sess.ID)] = sess
+	if pendingCommands := p.takePendingCommandsLocked(string(sess.ID)); len(pendingCommands) > 0 {
+		sess.setCommands(pendingCommands)
+		p.commands = append([]acp.AvailableCommand(nil), pendingCommands...)
+	}
 	p.mu.Unlock()
 	return nil
 }
@@ -681,6 +793,15 @@ func (p *Process) SetOnUpdate(sessionKey string, onUpdate func(SessionUpdate)) {
 	if sess != nil {
 		sess.setOnUpdate(onUpdate)
 	}
+}
+
+// WaitCommands waits up to timeout for the session's slash commands to arrive.
+func (p *Process) WaitCommands(ctx context.Context, sessionKey string, timeout time.Duration) error {
+	sess := p.getSessionByKey(sessionKey)
+	if sess == nil {
+		return errors.New("acp session not initialized")
+	}
+	return sess.waitCommands(ctx, timeout)
 }
 
 // SendMessage sends a prompt to a specific session.

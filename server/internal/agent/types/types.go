@@ -52,6 +52,13 @@ type Session interface {
 	Close() error
 }
 
+// CommandWaiter optionally waits for the agent to publish its slash commands.
+// ACP publishes commands asynchronously after the session is created, so
+// callers that need a complete list right away can wait for the first update.
+type CommandWaiter interface {
+	WaitCommands(ctx context.Context, timeout time.Duration) error
+}
+
 type ForkPointKind string
 
 const (
