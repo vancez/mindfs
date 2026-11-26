@@ -82,27 +82,30 @@
     },
     {
       "name": "antigravity",
-      "brief": "Google 的 Antigravity 开发 agent，通过 shindgew/agy-acp 适配器接入，复用本机 agy CLI 的登录状态；首次使用前请运行 agy 完成登录，需要 Node.js 22+。",
+      "brief": "Google 的 Antigravity 开发 agent，内置 ACP server，直接用 agy acp 接入并复用本机 agy CLI 的登录状态；首次使用前请运行 agy 完成登录（或 agy acp --login）。",
       "installCommands": [
-        { "os": ["darwin", "linux", "windows"], "command": "npm install -g agy-acp@0.5.2" }
+        { "os": ["darwin", "linux"], "command": "curl -fsSL https://antigravity.google/cli/install.sh | bash" },
+        { "os": "windows", "command": "irm https://antigravity.google/cli/install.ps1 | iex" }
       ],
       "updateCommands": [
-        { "os": ["darwin", "linux", "windows"], "command": "agy update" },
-        { "os": ["darwin", "linux", "windows"], "command": "npm install -g agy-acp@0.5.2" }
+        { "os": ["darwin", "linux", "windows"], "command": "agy update" }
       ],
-      "command": "agy-acp",
+      "command": "agy",
       "protocol": "acp",
-      "args": [],
+      "args": [
+        "acp"
+      ],
       "configBackup": {
         "fileSources": [
           "~/.gemini/antigravity-cli/settings.json",
           "~/.gemini/config/mcp_config.json"
         ],
         "envKeys": [
-          "AGY_BIN",
-          "GEMINI_HOME",
           "GEMINI_API_KEY",
-          "GOOGLE_GEMINI_BASE_URL"
+          "GOOGLE_GEMINI_BASE_URL",
+          "GOOGLE_GENAI_USE_VERTEXAI",
+          "GOOGLE_CLOUD_PROJECT",
+          "GOOGLE_CLOUD_LOCATION"
         ]
       }
     },
