@@ -1217,6 +1217,167 @@ Object.assign(window, { runCompletionAnchorHardeningChecks: async () => {
   };
 }});
 
+// On iOS the compositor applies a swipe before touchmove reaches the page, so
+// the first pause this handler observes can already be at the reading
+// position. The settle check used to see "no upward movement since the pause",
+// treat the gesture as a stray tap and re-arm following — often only visible
+// when the reply completed and the next update snapped the reader to the
+// tail. The pause must be measured from where the finger landed.
+Object.assign(window, { runPauseTimingChecks: async () => {
+  const settle = (ms = 250) => new Promise((resolve) => setTimeout(resolve, ms));
+  const assert = (condition: boolean, message: string) => { if (!condition) throw new Error(message); };
+  const stamp = '2026-11-26T00:00:00Z';
+  const line = '这是一段用于模拟 iOS 先滚动后派发 touchmove 的阅读内容。';
+  const history: any[] = [];
+  for (let i = 0; i < 14; i += 1) {
+    history.push({ seq: i * 2 + 1, role: 'user', content: `问题 ${i}\n${line.repeat(2)}`, timestamp: stamp });
+    history.push({ seq: i * 2 + 2, role: 'agent', content: `回答 ${i}\n\n${line.repeat(5)}`, timestamp: stamp });
+  }
+  const user = { seq: 29, role: 'user', content: '请继续', timestamp: stamp };
+  let content = line.repeat(6);
+  const render = (pending: boolean) => (window as any).check.replaceSession({
+    key: 'pause-timing',
+    pending,
+    exchanges: pending
+      ? [...history, user, { role: 'agent', content, timestamp: stamp }]
+      : [...history, user, { seq: 30, role: 'agent', content, timestamp: stamp }],
+    exchange_aux: {},
+  });
+  render(true);
+  await settle(700);
+  const el = [...document.querySelectorAll('div')].find((node) => getComputedStyle(node).overflowY === 'auto') as HTMLElement;
+  const gap = () => Math.round(el.scrollHeight - el.clientHeight - el.scrollTop);
+  const jumpButton = () => document.querySelector('[data-mindfs-jump-latest="1"]') as HTMLElement | null;
+  const fireTouch = (type: string, clientY: number) =>
+    el.dispatchEvent(new TouchEvent(type, {
+      bubbles: true,
+      cancelable: true,
+      touches: type === 'touchend' ? [] : [new Touch({ identifier: 1, target: el, clientY })],
+    }));
+  el.style.overflowAnchor = 'none';
+  el.scrollTop = el.scrollHeight;
+  await settle(300);
+  el.scrollTop = el.scrollHeight;
+  await settle(300);
+  assert(gap() < 2, 'fixture should start at the tail');
+
+  // The finger lands at the tail, then the compositor applies the swipe
+  // before touchmove is delivered: the handler first sees the settled
+  // position instead of the landing position.
+  fireTouch('touchstart', 400);
+  el.scrollTop = Math.max(0, el.scrollTop - 420);
+  fireTouch('touchmove', 420);
+  await settle(120);
+  fireTouch('touchend', 420);
+  await settle(500);
+  const readingGap = gap();
+  assert(readingGap > 200, `pause measured from the applied scroll snapped back to the tail (${readingGap}px)`);
+  assert(!!jumpButton(), 'a reading pause measured from the applied scroll left no jump button');
+
+  // The turn completes and appends text. The paused reader must stay put.
+  content += '\n\n' + line.repeat(8);
+  render(false);
+  await settle(400);
+  assert(gap() > 200, `completion snapped the paused reader to the tail (${gap()}px)`);
+  content += '\n\n' + line.repeat(4);
+  render(false);
+  await settle(350);
+  assert(gap() > 200, `a later update dragged the paused reader down (${gap()}px)`);
+  return { passed: true, readingGap, finalGap: gap() };
+}});
+
+// The completion re-sync replaces the live row set: transient narration rows
+// below the reader disappear, the document shrinks, and the browser clamps
+// scrollTop onto the new bottom. That clamp is not a return gesture. Holding
+// the reading anchor across it must keep following off, so the reader's top
+// row is restored when the rebuilt layout grows back instead of the next
+// update pinning the tail.
+Object.assign(window, { runCompletionClampChecks: async () => {
+  const settle = (ms = 250) => new Promise((resolve) => setTimeout(resolve, ms));
+  const assert = (condition: boolean, message: string) => { if (!condition) throw new Error(message); };
+  const stamp = '2026-11-26T00:00:00Z';
+  const line = '这是一段用于复现完成时行集重建导致滚动钳制的内容。';
+  const history: any[] = [];
+  for (let i = 0; i < 10; i += 1) {
+    history.push({ seq: i * 2 + 1, role: 'user', content: `问题 ${i}\n${line.repeat(2)}`, timestamp: stamp });
+    history.push({ seq: i * 2 + 2, role: 'agent', content: `回答 ${i}\n\n${line.repeat(4)}`, timestamp: stamp });
+  }
+  const key = 'completion-clamp';
+  const user = { seq: 21, role: 'user', content: '请继续', timestamp: stamp };
+  const answer = `最终回复\n\n${line.repeat(3)}`;
+  // A tall transient narration row sits below the reader while the turn is
+  // live; the persisted exchange drops it. Paragraph breaks keep it tall at
+  // both phone and desktop widths.
+  const narrationBlock = `中间说明\n\n${line}\n\n`;
+  const narration = { role: 'agent', content: narrationBlock.repeat(20), timestamp: stamp };
+  const live = {
+    key,
+    pending: true,
+    exchanges: [...history, user, { role: 'agent', content: answer, timestamp: stamp }, narration],
+    exchange_aux: {},
+  };
+  const completed = () => ({
+    key,
+    pending: false,
+    exchanges: [...history, user, { seq: 22, role: 'agent', content: answer, timestamp: stamp }],
+    exchange_aux: {},
+  });
+  (window as any).check.replaceSession(live);
+  await settle(700);
+  const el = [...document.querySelectorAll('div')].find((node) => getComputedStyle(node).overflowY === 'auto') as HTMLElement;
+  const gap = () => Math.round(el.scrollHeight - el.clientHeight - el.scrollTop);
+  const answerRow = () =>
+    [...el.querySelectorAll<HTMLElement>('[data-timeline-index]')]
+      .find((node) => (node.innerText || '').includes('最终回复'));
+  const topOffset = (row: HTMLElement) =>
+    row.getBoundingClientRect().top - el.getBoundingClientRect().top;
+  el.style.overflowAnchor = 'none';
+  el.scrollTop = el.scrollHeight;
+  await settle(300);
+  el.scrollTop = el.scrollHeight;
+  await settle(300);
+  // Read from the start of the answer with the narration row below.
+  const narrationRow = [...el.querySelectorAll<HTMLElement>('[data-timeline-index]')]
+    .find((node) => (node.innerText || '').includes('中间说明'));
+  assert(!!narrationRow && !!answerRow(), 'missing live narration or answer row');
+  // Explicit reading pause (wheel up), then align the answer's start with the
+  // top of the viewport and let the narration row sit below the fold.
+  el.dispatchEvent(new WheelEvent('wheel', { bubbles: true, deltaY: -5 }));
+  el.scrollTop = Math.max(0, el.scrollTop + topOffset(answerRow()!) - 40);
+  await settle(400);
+  assert(gap() > 200, `fixture should be reading above the transient narration (${gap()}px)`);
+  const beforeTop = topOffset(answerRow()!);
+
+  (sessionService as any).dispatchDecrypted('session.done', key, { root_id: 'test' }, {});
+  (window as any).check.replaceSession(completed());
+  await settle(500);
+  // The row set shrank below the reader; the browser may have clamped the
+  // viewport onto the tail. Following must not re-arm from that. New content
+  // then grows below; the anchor restores the reading row instead of the
+  // next update pinning the tail.
+  (window as any).check.replaceSession({
+    ...completed(),
+    exchanges: [
+      ...completed().exchanges,
+      { seq: 23, role: 'agent', content: `继续输出\n\n${line}\n\n`.repeat(20), timestamp: stamp },
+    ],
+  });
+  await settle(600);
+  const afterRow = answerRow();
+  assert(!!afterRow, 'answer row disappeared after the completion rebuild');
+  const afterGap = gap();
+  assert(
+    afterGap > 200,
+    `a completion shrink-clamp re-armed following (${afterGap}px from the tail)`,
+  );
+  const afterTop = topOffset(afterRow!);
+  assert(
+    Math.abs(afterTop - beforeTop) < 24,
+    `completion did not restore the reading row (${Math.round(beforeTop)} -> ${Math.round(afterTop)}px)`,
+  );
+  return { passed: true, afterGap, beforeTop: Math.round(beforeTop), afterTop: Math.round(afterTop) };
+}});
+
 // The transcript reserves tall tail space below the last row for the floating
 // jump/task controls, so a reader can stop with the newest message fully
 // visible while the scrollable bottom is still ~65-85px further down. Treating

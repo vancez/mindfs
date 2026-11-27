@@ -171,6 +171,42 @@ registerSessionViewerChecks([
       );
     },
   },
+  // iOS applies a swipe before touchmove reaches the page, so the first
+  // observed pause position can already be the reading position. The settle
+  // check must measure from where the finger landed instead of treating the
+  // gesture as a stray tap and re-arming following.
+  {
+    run: "runPauseTimingChecks",
+    label: "a reading pause survives iOS scrolled-before-touchmove timing",
+    verify: (result) => {
+      assert.ok(
+        result.readingGap > 200,
+        `pause settle snapped back to the tail (${result.readingGap}px)`,
+      );
+      assert.ok(
+        result.finalGap > 200,
+        `completion dragged the paused reader down (${result.finalGap}px)`,
+      );
+    },
+  },
+  // The completion re-sync can drop tall transient rows below a paused
+  // reader, and the browser clamps scrollTop onto the shrunken bottom. That
+  // clamp is a layout correction: it must not re-arm following or the next
+  // update pins the reader to the tail.
+  {
+    run: "runCompletionClampChecks",
+    label: "a completion shrink-clamp does not re-arm a paused reader",
+    verify: (result) => {
+      assert.ok(
+        result.afterGap > 200,
+        `the shrink-clamp re-armed following (${result.afterGap}px from the tail)`,
+      );
+      assert.ok(
+        Math.abs(result.afterTop - result.beforeTop) < 24,
+        `completion did not restore the reading row (${result.beforeTop} -> ${result.afterTop}px)`,
+      );
+    },
+  },
 
   // --- Tail layout ----------------------------------------------------------
   // The floating user-message-summary control must stay below the last

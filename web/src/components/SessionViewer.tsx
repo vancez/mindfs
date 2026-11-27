@@ -2140,10 +2140,17 @@ function SessionViewerInner({
     }
     if (start !== null) {
       const maxTop = Math.max(0, container.scrollHeight - container.clientHeight);
-      const target = Math.max(0, Math.min(maxTop, start - anchor.offset));
-      if (Math.abs(container.scrollTop - target) > 1) {
-        readingAnchorWriteRef.current = { at: performance.now(), offset: target };
-        container.scrollTop = target;
+      const desired = start - anchor.offset;
+      // While a rebuild replaces measured rows with estimates, the anchor row
+      // can resolve beyond the current scroll body. Writing the clamped
+      // bottom would drag the reader to the tail; keep the frame loop armed
+      // and restore the row once the rebuilt layout gives it room again.
+      if (desired <= maxTop + 1) {
+        const target = Math.max(0, desired);
+        if (Math.abs(container.scrollTop - target) > 1) {
+          readingAnchorWriteRef.current = { at: performance.now(), offset: target };
+          container.scrollTop = target;
+        }
       }
     }
     if (performance.now() < readingAnchorDeadlineRef.current) {
@@ -2816,6 +2823,7 @@ function SessionViewerInner({
     let lastScrollTop = el.scrollTop;
     let lastScrollHeight = el.scrollHeight;
     let touchY: number | null = null;
+    let touchStartTop: number | null = null;
     let touchStartedInNestedScroller = false;
     let settleTimer: number | null = null;
     // Finger jitter and sub-pixel scroll positions can leave a few pixels of
@@ -2876,6 +2884,15 @@ function SessionViewerInner({
       return false;
     };
     const resumeFollowingAtBottom = () => {
+      // A completion hold is armed, so no wheel/touch/key input has arrived
+      // since the turn finished (those release the hold in their own capture
+      // handlers). Whatever moved the viewport is the re-sync settling; a
+      // clamp can land it on the tail without the reader going there, and
+      // re-arming here is exactly the snap to the bottom this hold exists to
+      // prevent.
+      if (readingAnchorRef.current !== null) {
+        return;
+      }
       let strayOrGrowth = false;
       if (!atBottom()) {
         // An expanded card or a summary/search jump is a deliberate stop;
@@ -2928,7 +2945,16 @@ function SessionViewerInner({
     };
     const pauseFollowing = (fromTouch: boolean) => {
       if (!userPausedFollowingRef.current) {
-        pauseOriginTopRef.current = el.scrollTop;
+        // Measure the pause from where the finger landed, not from the
+        // position this handler happens to observe. iOS applies the swipe in
+        // the compositor first, so scrollTop can already be the reading
+        // position by the time touchmove reaches us; the settle check then
+        // saw "no upward movement", treated the gesture as a stray tap and
+        // re-armed following, snapping the reader back to the tail.
+        pauseOriginTopRef.current =
+          fromTouch && touchStartTop !== null
+            ? Math.max(el.scrollTop, touchStartTop)
+            : el.scrollTop;
         intentionalPauseRef.current = false;
         touchPauseRef.current = fromTouch;
       }
@@ -2969,6 +2995,7 @@ function SessionViewerInner({
         event.touches.length === 1 &&
         hasNestedVerticalScroller(event.target);
       touchY = event.touches.length === 1 ? event.touches[0].clientY : null;
+      touchStartTop = event.touches.length === 1 ? el.scrollTop : null;
     };
     const onTouchMove = (event: TouchEvent) => {
       const nextY = event.touches.length === 1 ? event.touches[0].clientY : null;
@@ -2986,6 +3013,7 @@ function SessionViewerInner({
     };
     const onTouchEnd = () => {
       touchY = null;
+      touchStartTop = null;
       touchStartedInNestedScroller = false;
     };
     const updateStickiness = (event?: Event) => {
@@ -3045,22 +3073,32 @@ function SessionViewerInner({
         readingAnchorRef.current !== null &&
         (now - timelineRebuildAtRef.current < SESSION_COMPLETION_REBUILD_GRACE_MS ||
           now - readingAnchorArmedAtRef.current < SESSION_COMPLETION_REBUILD_GRACE_MS);
-      // Any movement that is neither a virtualizer height correction, the
-      // completion anchor write, a tail pin, nor a document shrink/clamp came
-      // from the reader (a scrollbar drag emits no wheel/touch event). Stop
-      // pinning the reading anchor and remember that the reader owns the
-      // viewport until the gesture and its momentum settle.
-      if (
-        (movedUp || movedDown) &&
-        !contentShrank &&
-        !measurementAdjusted &&
-        !anchorAdjusted &&
-        !sessionStickAdjusted &&
-        !completionRebuildGrace
-      ) {
+      // A movement that is either a virtualizer height correction, the
+      // completion anchor write, a tail pin, a document shrink/clamp or a
+      // rebuild correction is the layout settling, not the reader. A shrink
+      // in particular can clamp scrollTop onto the tail while the reader
+      // stays where they were.
+      const layoutCorrection =
+        contentShrank ||
+        measurementAdjusted ||
+        anchorAdjusted ||
+        sessionStickAdjusted ||
+        completionRebuildGrace;
+      // Any movement that is none of those came from the reader (a scrollbar
+      // drag emits no wheel/touch event). Stop pinning the reading anchor and
+      // remember that the reader owns the viewport until the gesture and its
+      // momentum settle.
+      if ((movedUp || movedDown) && !layoutCorrection) {
         releaseReadingAnchor();
         lastUserViewportMovementAtRef.current = now;
       }
+      // Once a completion hold survives the release above, no wheel/touch/key
+      // input has arrived since the turn finished: those handlers release the
+      // hold before this runs. Every scroll event left is the re-sync
+      // rebuilding rows, so position alone must never re-arm following here —
+      // otherwise a row-set rebuild that lands the viewport on the tail turns
+      // a paused reader into a tail-follower again.
+      const completionHold = readingAnchorRef.current !== null;
       // The tail wins over direction: an iOS overscroll bounce reports upward
       // movement while the view is still at (or beyond) the bottom, and the
       // bounce must not pause following or surface the jump button. Resuming
@@ -3080,12 +3118,13 @@ function SessionViewerInner({
       // reply streams, and re-arming there dragged a slow upward drag back
       // down on every chunk. Reading gestures keep their pause too.
       if (
-        (!userPausedFollowingRef.current &&
+        !completionHold &&
+        ((!userPausedFollowingRef.current &&
           (rawDistanceFromBottom <= bottomSlop ||
             (!shouldStickToBottomRef.current && tailEndVisible()))) ||
-        (intentionalPauseRef.current &&
-          contentShrank &&
-          isNearSessionTail())
+          (intentionalPauseRef.current &&
+            contentShrank &&
+            isNearSessionTail()))
       ) {
         resumeFollowing();
       } else if (movedUp && !contentShrank) {
@@ -3103,6 +3142,7 @@ function SessionViewerInner({
         }
       } else if (
         movedDown &&
+        !layoutCorrection &&
         (isNearBottom ||
           (performance.now() - lastDownwardIntentAtRef.current < 600 &&
             isNearSessionTail()))
@@ -3216,9 +3256,13 @@ function SessionViewerInner({
       // merge/collapse hides the jump button at the tail, so keeping
       // following off would be an invisible pause, while streamed growth
       // must leave the deliberate pause alone.
+      // A completion hold means the reader paused before the turn finished
+      // and no input has arrived since: the re-sync's own shrink/growth must
+      // not re-arm following and pull them to the tail.
       if (
-        (distanceFromBottom <= 8 && !userPausedFollowingRef.current) ||
-        (intentionalPauseRef.current && contentShrank && isNearSessionTail())
+        readingAnchorRef.current === null &&
+        ((distanceFromBottom <= 8 && !userPausedFollowingRef.current) ||
+          (intentionalPauseRef.current && contentShrank && isNearSessionTail()))
       ) {
         resumeFollowing();
         return;

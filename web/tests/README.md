@@ -28,7 +28,9 @@ regressions. One Vite server and browser run all 15 SessionViewer checks at a
   streamed growth, iOS fling momentum, nested scrollers, composer/keyboard
   resizes, paused readers across streamed appends, the user-summary popup,
   editing a message and resending, and collapsed/merged expanded cards.
-- Content growth after render, and the completion re-sync's reading anchor.
+- Content growth after render, the completion re-sync's reading anchor across
+  re-keys/late syncs, a pause measured after iOS applies the swipe (before
+  `touchmove`), and a completion shrink-clamp that must not re-arm following.
 - Tail clearance for the floating user-message-summary control.
 - Virtualizer row/text estimates at phone width (iPhone UA, touch enabled).
 - Expanded tool cards across streamed updates and turn completion, and duplicate
