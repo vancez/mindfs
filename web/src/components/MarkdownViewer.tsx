@@ -834,7 +834,7 @@ function MarkdownViewerInner({
               </a>
             );
           },
-          table: ({ node, ...props }: any) => (
+          table: ({ node, style, ...props }: any) => (
             <div
               {...getSourceLineProps(node)}
               style={{
@@ -847,53 +847,58 @@ function MarkdownViewerInner({
               }}
             >
               <table
+                {...props}
                 style={{
                   width: "100%",
                   borderCollapse: "collapse",
                   fontSize: "14px",
                   lineHeight: 1.6,
                   minWidth: "520px",
+                  ...style,
                 }}
-                {...props}
               />
             </div>
           ),
-          thead: (props) => (
+          thead: ({ node: _node, style, ...props }: any) => (
             <thead
+              {...props}
               style={{
                 background: "rgba(0,0,0,0.04)",
+                ...style,
               }}
-              {...props}
             />
           ),
-          tr: (props) => (
+          tr: ({ node: _node, style, ...props }: any) => (
             <tr
+              {...props}
               style={{
                 borderBottom: "1px solid var(--border-color)",
+                ...style,
               }}
-              {...props}
             />
           ),
-          th: (props) => (
+          th: ({ node: _node, style, ...props }: any) => (
             <th
+              {...props}
               style={{
                 padding: "10px 12px",
                 textAlign: "left",
                 fontWeight: 600,
                 whiteSpace: "nowrap",
                 verticalAlign: "top",
+                ...style,
               }}
-              {...props}
             />
           ),
-          td: (props) => (
+          td: ({ node: _node, style, ...props }: any) => (
             <td
+              {...props}
               style={{
                 padding: "10px 12px",
                 verticalAlign: "top",
                 borderTop: "1px solid rgba(0,0,0,0.03)",
+                ...style,
               }}
-              {...props}
             />
           ),
           blockquote: ({ node, ...props }: any) => (
