@@ -4,6 +4,8 @@ import (
 	"errors"
 	"io"
 	"os"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -11,6 +13,45 @@ import (
 
 	acpsdk "github.com/coder/acp-go-sdk"
 )
+
+func TestSessionStateEmitSerializesHandlerInvocations(t *testing.T) {
+	var state sessionState
+	var active int32
+	var overlaps int32
+	state.setOnUpdate(func(SessionUpdate) {
+		if atomic.AddInt32(&active, 1) > 1 {
+			atomic.AddInt32(&overlaps, 1)
+		}
+		time.Sleep(time.Millisecond)
+		atomic.AddInt32(&active, -1)
+	})
+
+	const goroutines = 8
+	const updatesPerGoroutine = 25
+	var wg sync.WaitGroup
+	wg.Add(goroutines)
+	for i := 0; i < goroutines; i++ {
+		go func() {
+			defer wg.Done()
+			for j := 0; j < updatesPerGoroutine; j++ {
+				state.emit(SessionUpdate{Type: UpdateTypeToolCall})
+			}
+		}()
+	}
+	wg.Wait()
+
+	if got := atomic.LoadInt32(&overlaps); got != 0 {
+		t.Fatalf("handler invoked concurrently %d times", got)
+	}
+	if got := atomic.LoadInt32(&active); got != 0 {
+		t.Fatalf("active handlers = %d after emit completed", got)
+	}
+}
+
+func TestSessionStateEmitWithoutHandlerIsNoop(t *testing.T) {
+	var state sessionState
+	state.emit(SessionUpdate{Type: UpdateTypeToolCall})
+}
 
 func TestIsExpectedStreamCloseError(t *testing.T) {
 	for _, err := range []error{nil, os.ErrClosed, io.ErrClosedPipe, &os.PathError{Op: "read", Path: "|0", Err: os.ErrClosed}} {

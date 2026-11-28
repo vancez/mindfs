@@ -97,6 +97,7 @@ type sessionState struct {
 	contextUsageUpdateSeen bool
 	lastUsage              cumulativeTokenUsage
 	onUpdate               func(SessionUpdate)
+	emitMu                 sync.Mutex
 	mu                     sync.RWMutex
 }
 
@@ -114,8 +115,6 @@ type qwenSlashCommandNotification struct {
 	Message     string `json:"message"`
 }
 
-type sessionUpdateHandler func(SessionUpdate)
-
 func (s *sessionState) setOnUpdate(onUpdate func(SessionUpdate)) {
 	s.mu.Lock()
 	s.onUpdate = onUpdate
@@ -126,6 +125,24 @@ func (s *sessionState) getOnUpdate() func(SessionUpdate) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.onUpdate
+}
+
+// emit delivers an update to the session handler. Handlers are invoked from
+// the ACP notification loop, from per-request goroutines (permission
+// requests), and from the prompt caller when the turn completes; serialize
+// delivery so each session sees one ordered update stream and downstream
+// callback state is never read and written concurrently.
+func (s *sessionState) emit(update SessionUpdate) {
+	if s == nil {
+		return
+	}
+	s.emitMu.Lock()
+	defer s.emitMu.Unlock()
+	handler := s.getOnUpdate()
+	if handler == nil {
+		return
+	}
+	handler(update)
 }
 
 func (s *sessionState) setModels(models *acp.SessionModelState) {
@@ -335,14 +352,6 @@ func (p *Process) agentLabel() string {
 	return p.agentName
 }
 
-func (p *Process) getSessionUpdateHandler(sessionID string) sessionUpdateHandler {
-	session := p.getSessionByID(sessionID)
-	if session == nil {
-		return nil
-	}
-	return session.getOnUpdate()
-}
-
 func (c *mindfsClient) SessionUpdate(ctx context.Context, params acp.SessionNotification) error {
 	sessionID := string(params.SessionId)
 	session := c.proc.getSessionByID(sessionID)
@@ -369,7 +378,7 @@ func (c *mindfsClient) SessionUpdate(ctx context.Context, params acp.SessionNoti
 			params.Update.UsageUpdate.Used,
 			params.Update.UsageUpdate.Size,
 		) {
-			handler(SessionUpdate{
+			session.emit(SessionUpdate{
 				Type:      UpdateTypeContextUpdate,
 				SessionID: sessionID,
 			})
@@ -378,7 +387,7 @@ func (c *mindfsClient) SessionUpdate(ctx context.Context, params acp.SessionNoti
 
 	internalUpdate := wrapSessionUpdate(sessionID, params.Update)
 	if internalUpdate.Type != "" {
-		handler(internalUpdate)
+		session.emit(internalUpdate)
 	} else {
 		raw, _ := json.Marshal(params.Update)
 		log.Printf("[agent/acp] unhandled raw=%s", string(raw))
@@ -463,35 +472,33 @@ func (c *mindfsClient) RequestPermission(ctx context.Context, params acp.Request
 	// Emit a synthetic tool_call update for permission-gated operations so upper
 	// layers can track tool execution and associate file paths immediately.
 	if session := c.proc.getSessionByID(string(params.SessionId)); session != nil {
-		if handler := session.getOnUpdate(); handler != nil {
-			toolCall := &acp.SessionUpdateToolCall{
-				Content:    params.ToolCall.Content,
-				Locations:  params.ToolCall.Locations,
-				RawInput:   params.ToolCall.RawInput,
-				RawOutput:  params.ToolCall.RawOutput,
-				Title:      "",
-				ToolCallId: params.ToolCall.ToolCallId,
-				Status:     acp.ToolCallStatusPending,
-			}
-			if params.ToolCall.Title != nil {
-				toolCall.Title = *params.ToolCall.Title
-			}
-			if params.ToolCall.Kind != nil {
-				toolCall.Kind = *params.ToolCall.Kind
-			} else {
-				toolCall.Kind = acp.ToolKindOther
-			}
-			if params.ToolCall.Status != nil {
-				toolCall.Status = *params.ToolCall.Status
-			}
-			handler(SessionUpdate{
-				Type:      UpdateTypeToolCall,
-				SessionID: string(params.SessionId),
-				Raw: acp.SessionUpdate{
-					ToolCall: toolCall,
-				},
-			})
+		toolCall := &acp.SessionUpdateToolCall{
+			Content:    params.ToolCall.Content,
+			Locations:  params.ToolCall.Locations,
+			RawInput:   params.ToolCall.RawInput,
+			RawOutput:  params.ToolCall.RawOutput,
+			Title:      "",
+			ToolCallId: params.ToolCall.ToolCallId,
+			Status:     acp.ToolCallStatusPending,
 		}
+		if params.ToolCall.Title != nil {
+			toolCall.Title = *params.ToolCall.Title
+		}
+		if params.ToolCall.Kind != nil {
+			toolCall.Kind = *params.ToolCall.Kind
+		} else {
+			toolCall.Kind = acp.ToolKindOther
+		}
+		if params.ToolCall.Status != nil {
+			toolCall.Status = *params.ToolCall.Status
+		}
+		session.emit(SessionUpdate{
+			Type:      UpdateTypeToolCall,
+			SessionID: string(params.SessionId),
+			Raw: acp.SessionUpdate{
+				ToolCall: toolCall,
+			},
+		})
 	}
 	// TODO: Forward to frontend for user approval
 	// For now, auto-approve with first allow option
@@ -569,8 +576,8 @@ func (c *mindfsClient) handleQwenSlashCommandNotification(params json.RawMessage
 	if strings.TrimSpace(notif.SessionID) == "" {
 		return acp.NewInvalidParams(map[string]any{"error": "sessionId required"})
 	}
-	handler := c.proc.getSessionUpdateHandler(notif.SessionID)
-	if handler == nil {
+	session := c.proc.getSessionByID(notif.SessionID)
+	if session == nil || session.getOnUpdate() == nil {
 		return nil
 	}
 	content := notif.Message
@@ -578,7 +585,7 @@ func (c *mindfsClient) handleQwenSlashCommandNotification(params json.RawMessage
 		return nil
 	}
 	log.Printf("[agent/acp] ext.notification agent=%s method=_qwencode/slash_command session_id=%s command=%q message_type=%s", c.proc.agentLabel(), notif.SessionID, notif.Command, notif.MessageType)
-	handler(newMessageChunkUpdate(notif.SessionID, content, map[string]any{
+	session.emit(newMessageChunkUpdate(notif.SessionID, content, map[string]any{
 		"source":       "_qwencode/slash_command",
 		"command":      notif.Command,
 		"message_type": notif.MessageType,
@@ -845,13 +852,11 @@ func (p *Process) SendMessage(ctx context.Context, sessionKey, content string) e
 	}
 
 	// Signal completion
-	if onUpdate := sess.getOnUpdate(); onUpdate != nil {
-		onUpdate(SessionUpdate{
-			Type:       UpdateTypeMessageDone,
-			SessionID:  string(sess.ID),
-			TokenUsage: tokenUsage,
-		})
-	}
+	sess.emit(SessionUpdate{
+		Type:       UpdateTypeMessageDone,
+		SessionID:  string(sess.ID),
+		TokenUsage: tokenUsage,
+	})
 	log.Printf("[agent/acp] send.done agent=%s session_key=%s duration_ms=%d", p.agentLabel(), sessionKey, time.Since(start).Milliseconds())
 
 	return nil
