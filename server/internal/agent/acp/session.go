@@ -707,12 +707,7 @@ func convertToolCallContent(items []acpsdk.ToolCallContent) []types.ToolCallCont
 			continue
 		}
 		if item.Diff != nil {
-			out = append(out, types.ToolCallContentItem{
-				Type:    "diff",
-				Path:    item.Diff.Path,
-				OldText: item.Diff.OldText,
-				NewText: item.Diff.NewText,
-			})
+			out = append(out, convertDiffContent(item.Diff))
 			continue
 		}
 	}
